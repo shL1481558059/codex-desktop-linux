@@ -108,11 +108,150 @@ impl RuntimeConfig {
     }
 }
 
+const APP_SETTINGS_FILE: &str = "settings.json";
+const DEFAULT_APP_ID: &str = "codex-desktop";
+const AUTO_INSTALL_SETTING_KEY: &str = "codex-linux-auto-update-on-exit";
+
+/// Resolves the Codex Desktop app id the same way the Linux launcher and main
+/// bundle do: `CODEX_LINUX_APP_ID`, then `CODEX_APP_ID`, then `codex-desktop`.
+/// Invalid ids fall back to the default so a malformed env value can never point
+/// the lookup at an attacker-controlled path.
+fn resolve_app_id() -> String {
+    fn valid(id: &str) -> bool {
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    }
+
+    for var in ["CODEX_LINUX_APP_ID", "CODEX_APP_ID"] {
+        if let Ok(value) = std::env::var(var) {
+            if valid(&value) {
+                return value;
+            }
+        }
+    }
+    DEFAULT_APP_ID.to_string()
+}
+
+/// Resolves the app `settings.json` path mirroring the launcher
+/// (`launcher/start.sh.template`) and the main-bundle persistence helper
+/// (`scripts/patches/launch-actions.js`): honor `CODEX_LINUX_SETTINGS_FILE`
+/// first, then `XDG_CONFIG_HOME`, then `$HOME/.config`, joined with the app id.
+fn app_settings_path() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("CODEX_LINUX_SETTINGS_FILE") {
+        if !explicit.is_empty() {
+            return Some(PathBuf::from(explicit));
+        }
+    }
+
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+
+    Some(config_home.join(resolve_app_id()).join(APP_SETTINGS_FILE))
+}
+
+/// Coerces a settings.json value into a boolean the same way the launcher's
+/// `linux_setting_enabled` helper does: real booleans pass through, numbers are
+/// truthy when non-zero, and strings are falsey only for `0/false/no/off`.
+fn coerce_setting_bool(value: &serde_json::Value) -> Option<bool> {
+    match value {
+        serde_json::Value::Bool(flag) => Some(*flag),
+        serde_json::Value::Number(number) => number.as_f64().map(|n| n != 0.0),
+        serde_json::Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            Some(!matches!(normalized.as_str(), "0" | "false" | "no" | "off"))
+        }
+        _ => None,
+    }
+}
+
+/// Reads the user's auto-install-on-exit preference from the app
+/// `settings.json`. Returns `Some(true|false)` only when the toggle key is
+/// present and coercible; any missing file, parse error, or absent key yields
+/// `None` so the caller falls back to the config/default value. Never panics.
+pub fn settings_auto_install_override() -> Option<bool> {
+    let path = app_settings_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    let object = parsed.as_object()?;
+    coerce_setting_bool(object.get(AUTO_INSTALL_SETTING_KEY)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Result;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::tempdir;
+
+    // Env vars are process-global, so settings-override tests must not run in
+    // parallel with one another.
+    fn settings_env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Writes `settings.json` content to a tempfile, points
+    /// `CODEX_LINUX_SETTINGS_FILE` at it, and returns the override result.
+    /// `None` content means "do not create the file" (missing-file case).
+    fn override_with_settings(content: Option<&str>) -> Option<bool> {
+        let _guard = settings_env_lock();
+        let temp = tempdir().expect("tempdir");
+        let settings_path = temp.path().join("settings.json");
+        if let Some(body) = content {
+            std::fs::write(&settings_path, body).expect("write settings");
+        }
+        std::env::set_var("CODEX_LINUX_SETTINGS_FILE", &settings_path);
+        let result = settings_auto_install_override();
+        std::env::remove_var("CODEX_LINUX_SETTINGS_FILE");
+        result
+    }
+
+    #[test]
+    fn settings_override_reads_explicit_bool() {
+        assert_eq!(
+            override_with_settings(Some(r#"{"codex-linux-auto-update-on-exit": false}"#)),
+            Some(false)
+        );
+        assert_eq!(
+            override_with_settings(Some(r#"{"codex-linux-auto-update-on-exit": true}"#)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn settings_override_coerces_string_and_number() {
+        assert_eq!(
+            override_with_settings(Some(r#"{"codex-linux-auto-update-on-exit": "off"}"#)),
+            Some(false)
+        );
+        assert_eq!(
+            override_with_settings(Some(r#"{"codex-linux-auto-update-on-exit": "on"}"#)),
+            Some(true)
+        );
+        assert_eq!(
+            override_with_settings(Some(r#"{"codex-linux-auto-update-on-exit": 0}"#)),
+            Some(false)
+        );
+        assert_eq!(
+            override_with_settings(Some(r#"{"codex-linux-auto-update-on-exit": 1}"#)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn settings_override_absent_yields_none() {
+        // Missing file, malformed JSON, non-object, and absent key all fall back.
+        assert_eq!(override_with_settings(None), None);
+        assert_eq!(override_with_settings(Some("not json{")), None);
+        assert_eq!(override_with_settings(Some("[1,2,3]")), None);
+        assert_eq!(override_with_settings(Some(r#"{"other-key": true}"#)), None);
+    }
 
     #[test]
     fn loads_default_when_config_is_missing() -> Result<()> {

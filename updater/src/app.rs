@@ -36,7 +36,13 @@ pub async fn run(cli: Cli) -> Result<()> {
     paths.ensure_dirs()?;
     logging::init(&paths.log_file)?;
 
-    let config = RuntimeConfig::load_or_default(&paths)?;
+    let mut config = RuntimeConfig::load_or_default(&paths)?;
+    // The in-app "Install updates when you close Codex" toggle persists to the
+    // Linux settings.json and overrides the config/default auto-install
+    // preference when present. Absent ⇒ keep the config/default value.
+    if let Some(auto_install) = crate::config::settings_auto_install_override() {
+        config.auto_install_on_app_exit = auto_install;
+    }
     let mut state =
         PersistedState::load_or_default(&paths.state_file, config.auto_install_on_app_exit)?;
     let original_state = state.clone();

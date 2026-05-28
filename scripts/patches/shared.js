@@ -13,6 +13,7 @@ const linuxSettingsKeys = {
   promptWindow: "codex-linux-prompt-window-enabled",
   systemTray: "codex-linux-system-tray-enabled",
   warmStart: "codex-linux-warm-start-enabled",
+  autoUpdateOnExit: "codex-linux-auto-update-on-exit",
 };
 
 function readDirectoryNames(dir) {
