@@ -1507,7 +1507,7 @@ wait_for_webview_server() {
     # Under cold-login load the shell /dev/tcp probe can be a little too brittle,
     # while a short curl against index.html matches what Electron needs next.
     local attempt
-    for attempt in $(seq 1 100); do
+    for attempt in $(seq 1 20); do
         if webview_origin_is_reachable_fast; then
             echo "Webview server is ready"
             return 0

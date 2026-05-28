@@ -2603,7 +2603,7 @@ PY
     assert_contains "$REPO_DIR/launcher/start.sh.template" "kill -9 \"\$probe_pid\""
     assert_contains "$REPO_DIR/launcher/start.sh.template" 'curl --disable --noproxy 127.0.0.1,localhost --silent --show-error --fail --max-time 2'
     assert_contains "$REPO_DIR/launcher/start.sh.template" "webview_origin_is_reachable_fast"
-    assert_contains "$REPO_DIR/launcher/start.sh.template" "for attempt in \$(seq 1 100)"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "for attempt in \$(seq 1 20)"
     assert_contains "$REPO_DIR/launcher/start.sh.template" "sleep 0.05"
     assert_contains "$REPO_DIR/launcher/start.sh.template" "Webview origin verified."
     assert_contains "$REPO_DIR/launcher/start.sh.template" "hydrate_graphical_session_env"

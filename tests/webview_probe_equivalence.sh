@@ -98,6 +98,7 @@ load_new_impls() {
         extract_function verify_webview_origin
         extract_function webview_origin_is_reachable_fast
         extract_function webview_origin_is_reachable
+        extract_function wait_for_webview_server
     } > "$extracted"
 
     # Sanity check: extraction must have produced both function definitions.
@@ -105,6 +106,7 @@ load_new_impls() {
     grep -q '^verify_webview_origin() {$' "$extracted" || { rm -f "$extracted"; fail "verify_webview_origin not extracted from template"; }
     grep -q '^webview_origin_is_reachable_fast() {$' "$extracted" || { rm -f "$extracted"; fail "webview_origin_is_reachable_fast not extracted from template"; }
     grep -q '^webview_origin_is_reachable() {$' "$extracted" || { rm -f "$extracted"; fail "webview_origin_is_reachable not extracted from template"; }
+    grep -q '^wait_for_webview_server() {$' "$extracted" || { rm -f "$extracted"; fail "wait_for_webview_server not extracted from template"; }
 
     # shellcheck source=/dev/null
     source "$extracted"
@@ -115,12 +117,19 @@ load_new_impls() {
     eval "$(declare -f verify_webview_origin | sed '1s/^verify_webview_origin /verify_webview_origin__new /')"
     eval "$(declare -f webview_origin_is_reachable_fast | sed '1s/^webview_origin_is_reachable_fast /webview_origin_is_reachable_fast__new /')"
     eval "$(declare -f webview_origin_is_reachable | sed '1s/^webview_origin_is_reachable /webview_origin_is_reachable__new /')"
-    unset -f webview_port_is_open verify_webview_origin webview_origin_is_reachable_fast webview_origin_is_reachable
+    eval "$(declare -f wait_for_webview_server | sed '1s/^wait_for_webview_server /wait_for_webview_server__new /')"
+    unset -f webview_port_is_open verify_webview_origin webview_origin_is_reachable_fast webview_origin_is_reachable wait_for_webview_server
 
     # Reachability helpers call verify_webview_origin at runtime; keep that name wired
     # to the extracted implementation under test.
     verify_webview_origin() {
         verify_webview_origin__new "$@"
+    }
+    webview_origin_is_reachable_fast() {
+        webview_origin_is_reachable_fast__new "$@"
+    }
+    webview_origin_is_reachable() {
+        webview_origin_is_reachable__new "$@"
     }
 }
 
@@ -389,6 +398,18 @@ main() {
     start_slow_valid_fixture_server || fail "slow valid fixture server did not bind"
     assert_rc "new   fast probe rejects 300 ms response" 1 webview_origin_is_reachable_fast__new
     assert_rc "new   full verify accepts 300 ms response" 0 webview_origin_is_reachable__new
+    local t_slow0 t_slow1 slow_elapsed_ms
+    t_slow0=$(date +%s%N)
+    assert_rc "new   wait fallback accepts 300 ms response" 0 wait_for_webview_server__new
+    t_slow1=$(date +%s%N)
+    slow_elapsed_ms=$(( (t_slow1 - t_slow0) / 1000000 ))
+    run_count=$((run_count + 1))
+    if [ "$slow_elapsed_ms" -le 12000 ]; then
+        printf '  [PASS] slow wait fallback returned after %d ms\n' "$slow_elapsed_ms"
+    else
+        printf '  [FAIL] slow wait fallback returned after %d ms (expected <=12000 ms)\n' "$slow_elapsed_ms"
+        fail_count=$((fail_count + 1))
+    fi
     stop_slow_fixture_server
 
     setup_server || fail "fixture server did not bind after slow-valid probe"
