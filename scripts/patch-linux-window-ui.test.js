@@ -49,6 +49,7 @@ const {
   applyLinuxFastModeModelGuardPatch,
   applyLinuxOpaqueWindowsDefaultPatch,
   applyLinuxReadyToShowWindowStatePatch,
+  applyLinuxResizeRepaintPatch,
   applyLinuxSetIconPatch,
   applyLinuxRemoteControlConfigPreservationPatch,
   applyLinuxSingleInstancePatch,
@@ -618,6 +619,7 @@ test("default core patch descriptors are grouped and unique", () => {
     "linux-menu",
     "linux-multi-instance-bootstrap-lock",
     "linux-set-icon",
+    "linux-resize-repaint",
     "linux-opaque-background",
     "linux-avatar-overlay-mouse-passthrough",
     "linux-browser-use-availability",
@@ -2393,6 +2395,49 @@ test("gates ready-to-show maximize behind restored maximized state", () => {
     patched,
     /(^|[^&])D\.once\(`ready-to-show`,\(\)=>\{D\.isDestroyed\(\)\|\|D\.maximize\(\)\}\);/,
   );
+});
+
+test("installs Linux resize repaint hook without ungating ready-to-show maximize", () => {
+  const source = [
+    "let E=x?.isMaximized===!0,D={handlers:{},once(){},on(e,t){this.handlers[e]=t},isDestroyed(){return false},maximize(){},webContents:{isDestroyed(){return false},invalidate(){globalThis.__resizeRepaintCalls++}}},F={once(){},on(){},isDestroyed(){return false},webContents:{invalidate(){}}};",
+    "E&&D.once(`ready-to-show`,()=>{D.isDestroyed()||D.maximize()});",
+    "F.once(`ready-to-show`,()=>{});",
+    "globalThis.__resizeRepaintWindow=D;",
+  ].join("");
+
+  const patched = applyPatchTwice(
+    applyLinuxResizeRepaintPatch,
+    applyLinuxReadyToShowWindowStatePatch(source),
+  );
+
+  assert.match(patched, /function codexLinuxInstallResizeRepaintHook\(e\)/);
+  assert.match(
+    patched,
+    /process\.platform===`linux`&&codexLinuxInstallResizeRepaintHook\(D\),E&&D\.once\(`ready-to-show`,\(\)=>\{D\.isDestroyed\(\)\|\|D\.maximize\(\)\}\);/,
+  );
+  assert.match(
+    patched,
+    /process\.platform===`linux`&&codexLinuxInstallResizeRepaintHook\(F\),F\.once\(`ready-to-show`,\(\)=>\{\}\);/,
+  );
+  assert.match(
+    patched,
+    /setTimeout\(\(\)=>\{if\(__codexResizeRepaintScheduled=!1,e\.isDestroyed\(\)\)return;let __codexWebContents=e\.webContents;__codexWebContents==null\|\|__codexWebContents\.isDestroyed\?\.\(\)\|\|typeof __codexWebContents\.invalidate==`function`&&__codexWebContents\.invalidate\(\)\},16\)/,
+  );
+
+  const context = {
+    __resizeRepaintCalls: 0,
+    process: { platform: "linux" },
+    setTimeout(callback) {
+      callback();
+    },
+    x: { isMaximized: true },
+  };
+  context.globalThis = context;
+  vm.runInNewContext(
+    `${patched};codexLinuxInstallResizeRepaintHook(globalThis.__resizeRepaintWindow);globalThis.__resizeRepaintWindow.handlers.resize();`,
+    context,
+  );
+  assert.equal(context.__resizeRepaintCalls, 1);
 });
 
 test("skips the launch-action patch without throwing when upstream startup architecture changes", () => {

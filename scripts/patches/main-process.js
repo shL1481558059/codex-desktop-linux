@@ -285,7 +285,8 @@ function applyLinuxSetIconPatch(currentSource, iconAsset) {
   let patchedAny = false;
   const patchedSource = currentSource.replace(readyRegex, (match, windowVar, offset) => {
     const linuxPatch = `process.platform===\`linux\`&&${windowVar}.setIcon(${iconPathExpression}),`;
-    if (currentSource.slice(Math.max(0, offset - linuxPatch.length), offset) === linuxPatch) {
+    const prefix = currentSource.slice(Math.max(0, offset - Math.max(400, linuxPatch.length * 2)), offset);
+    if (prefix.includes(linuxPatch)) {
       return match;
     }
     patchedAny = true;
@@ -331,6 +332,50 @@ function applyLinuxReadyToShowWindowStatePatch(currentSource) {
   }
 
   return currentSource;
+}
+
+function applyLinuxResizeRepaintPatch(currentSource) {
+  const helperName = "codexLinuxInstallResizeRepaintHook";
+  const helper =
+    "function codexLinuxInstallResizeRepaintHook(e){if(!(process.platform===`linux`)||e.__codexLinuxResizeRepaintHookInstalled)return;e.__codexLinuxResizeRepaintHookInstalled=!0;let __codexResizeRepaintScheduled=!1,__codexResizeRepaint=()=>{__codexResizeRepaintScheduled||(__codexResizeRepaintScheduled=!0,setTimeout(()=>{if(__codexResizeRepaintScheduled=!1,e.isDestroyed())return;let __codexWebContents=e.webContents;__codexWebContents==null||__codexWebContents.isDestroyed?.()||typeof __codexWebContents.invalidate==`function`&&__codexWebContents.invalidate()},16))};e.on(`resize`,__codexResizeRepaint),e.on(`resized`,__codexResizeRepaint)}";
+  const readyToShowRegex =
+    /(^|[^A-Za-z0-9_$])((?:[A-Za-z_$][\w$]*&&)?)([A-Za-z_$][\w$]*)\.once\(`ready-to-show`,\(\)=>\{/g;
+  let patchedAny = false;
+  const patchedSource = currentSource.replace(
+    readyToShowRegex,
+    (match, leading, guardPrefix, windowVar, offset, source) => {
+      const linuxPatch = `process.platform===\`linux\`&&${helperName}(${windowVar}),`;
+      const insertionPoint = offset + leading.length;
+      const prefix = source.slice(Math.max(0, insertionPoint - Math.max(400, linuxPatch.length * 2)), insertionPoint);
+      if (prefix.includes(linuxPatch)) {
+        return match;
+      }
+      patchedAny = true;
+      return `${leading}${linuxPatch}${guardPrefix}${windowVar}.once(\`ready-to-show\`,()=>{`;
+    },
+  );
+
+  if (!patchedAny) {
+    if (currentSource.includes(`${helperName}(`)) {
+      return currentSource;
+    }
+    if (currentSource.includes("ready-to-show")) {
+      console.warn("WARN: Could not find ready-to-show hook — skipping Linux resize repaint patch");
+    }
+    return currentSource;
+  }
+
+  if (patchedSource.includes(`function ${helperName}(`)) {
+    return patchedSource;
+  }
+
+  for (const prefix of ['"use strict";', "'use strict';"]) {
+    if (patchedSource.startsWith(prefix)) {
+      return `${prefix}${helper}${patchedSource.slice(prefix.length)}`;
+    }
+  }
+
+  return `${helper}${patchedSource}`;
 }
 
 function applyLinuxOpaqueBackgroundPatch(currentSource) {
@@ -1411,6 +1456,7 @@ module.exports = {
   applyLinuxOpaqueBackgroundPatch,
   applyLinuxQuitGuardPatch,
   applyLinuxReadyToShowWindowStatePatch,
+  applyLinuxResizeRepaintPatch,
   applyLinuxRemoteControlConfigPreservationPatch,
   applyLinuxSetIconPatch,
   applyLinuxSingleInstancePatch,
