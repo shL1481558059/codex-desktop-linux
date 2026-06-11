@@ -3533,6 +3533,7 @@ make_fake_chrome_upstream_app() {
     mkdir -p \
         "$resources_dir/plugins/openai-bundled/.agents/plugins" \
         "$chrome_dir/.codex-plugin" \
+        "$chrome_dir/skills/control-chrome" \
         "$chrome_dir/scripts"
 
     cat > "$resources_dir/plugins/openai-bundled/.agents/plugins/marketplace.json" <<'JSON'
@@ -3544,6 +3545,18 @@ JSON
     cat > "$chrome_dir/scripts/installManifest.mjs" <<'JS'
 var n={extensionId:"hehggadaopoacecdllhhajmbjkdcmajg",extensionHostName:"com.openai.codexextension"};var p=o=>{let t=`${o.extensionHostName}.json`,r={darwin:["Library/Application Support/Google/Chrome/NativeMessagingHosts"],linux:[".config/google-chrome/NativeMessagingHosts"],win32:["AppData/Local/OpenAI/extension"]}[m.platform()];return r.map(s=>l.resolve(m.homedir(),s,t))};
 JS
+    cat > "$chrome_dir/skills/control-chrome/SKILL.md" <<'MD'
+# Chrome
+
+```js
+const { setupBrowserRuntime } = await import("<plugin root>/scripts/browser-client.mjs");
+await setupBrowserRuntime({ globals: globalThis });
+globalThis.browser = await agent.browsers.get("extension");
+nodeRepl.write(await browser.documentation());
+```
+
+Use the browser bound to `browser` for tasks in this skill.
+MD
     cat > "$chrome_dir/scripts/extension-id.json" <<'JSON'
 {"extensionId":"hehggadaopoacecdllhhajmbjkdcmajg","extensionHostName":"com.openai.codexextension"}
 JSON
@@ -3721,6 +3734,7 @@ test_chrome_plugin_staging() {
     assert_contains "$chrome_dir/scripts/browser-client.mjs" '".config","chromium"'
     assert_contains "$chrome_dir/scripts/browser-client.mjs" "instanceId:await IS(o.id,t,r)"
     assert_contains "$chrome_dir/scripts/browser-client.mjs" "codexLinuxRankBrowserBackends"
+    assert_contains "$chrome_dir/scripts/browser-client.mjs" "codexLinuxFilterBrowserBackends"
     assert_contains "$chrome_dir/scripts/browser-client.mjs" "getUserTabs()"
     assert_contains "$chrome_dir/scripts/browser-client.mjs" 'globalThis.nodeRepl?.env?.\[e\]'
     assert_not_contains "$chrome_dir/scripts/browser-client.mjs" 'globalThis.nodeRepl?.env\[e\]'
@@ -3728,6 +3742,11 @@ test_chrome_plugin_staging() {
     assert_not_contains "$chrome_dir/scripts/browser-client.mjs" "codexLinuxNativePipeFallback"
     assert_not_contains "$chrome_dir/scripts/browser-client.mjs" 'await import("node:net")'
     assert_contains "$chrome_dir/scripts/browser-client.mjs" "codexLinuxSiteStatusAllowlistFallback"
+    assert_contains "$chrome_dir/skills/control-chrome/SKILL.md" "activeSummaries"
+    assert_contains "$chrome_dir/skills/control-chrome/SKILL.md" "No active Chrome user tabs"
+    assert_contains "$chrome_dir/skills/control-chrome/SKILL.md" "agent.browsers.list()"
+    assert_contains "$chrome_dir/skills/control-chrome/SKILL.md" "browser.tabs.new()"
+    assert_not_contains "$chrome_dir/skills/control-chrome/SKILL.md" 'globalThis.browser = await agent.browsers.get("extension");'
     assert_contains "$install_dir/resources/plugins/openai-bundled/.agents/plugins/marketplace.json" '"name": "chrome"'
     assert_contains "$output_log" "Chrome plugin staged from upstream DMG"
 }
@@ -3786,6 +3805,20 @@ JS
     assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux Chrome profile metadata lookup"
     assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux Chrome profile instance matching"
     assert_not_contains "$patch_log" "browser-client.mjs missing patch target for Linux Chrome active profile backend ordering"
+
+    cat > "$browser_client" <<'JS'
+import p$,{platform as ek}from"node:os";import{readFile as a$}from"fs/promises";import{resolve as u$}from"path";import{resolve as Xq}from"path";import{homedir as Qq,platform as e$}from"os";var ld=Xq(Qq(),e$()==="win32"?"AppData\\Local\\Google\\Chrome\\User Data":"Library/Application Support/Google/Chrome");import{ClassicLevel as t$}from"./node_modules/classic-level.mjs";import{resolve as Zh}from"path";import{tmpdir as r$}from"os";import{cp as n$,mkdtemp as o$,rm as YA}from"fs/promises";import{existsSync as i$}from"fs";var ZA=async(e,t)=>{let r=Zh(ld,e,"Local Extension Settings",t);if(!i$(r))return null;let n=await o$(Zh(s$(),"codex"));await n$(r,n,{recursive:!0}),await YA(Zh(n,"LOCK"));let o=new t$(n,{createIfMissing:!1,keyEncoding:"utf8",valueEncoding:"utf8"});try{await o.open();let i=await o.get("extensionInstanceId");if(!i)return null;let s=JSON.parse(i);return typeof s!="string"?null:s}finally{await o.close(),await YA(n,{force:!0,recursive:!0})}},s$=()=>"nodeRepl"in globalThis&&globalThis.nodeRepl?globalThis.nodeRepl.tmpDir:r$();var XA=async e=>{if(e.type!=="extension"||!e.metadata?.extensionInstanceId||!e.metadata.extensionId)return e;let t=await l$(e.metadata.extensionId,e.metadata.extensionInstanceId);return t?{...e,metadata:{...e.metadata,profileName:t.name,profileIsLastUsed:t.isLastUsed.toString(),profileOrdering:t.orderingIndex.toString()}}:e},l$=async(e,t)=>(await c$(e)).find(o=>o.instanceId===t)||null,c$=async e=>{let t=await d$();return await Promise.all(t.map(async r=>({...r,instanceId:await ZA(r.id,e).catch(n=>(ue(n),null))})))},d$=async()=>{let e=u$(ld,"Local State"),t=JSON.parse(await a$(e,"utf8"));return t.profile.profiles_order.map((r,n)=>{let o=t.profile.info_cache[r];return o?{id:r,name:o.name,isLastUsed:t.profile.last_used===r,orderingIndex:n,avatarUrl:o.avatar_icon}:null}).filter(r=>!!r)};var Qh=Xy(p$.platform()),f$=async(e,{codexSessionId:t})=>{let r=Vu(Vy),n=e.filter(i=>i.info.type==="iab"),o=m$(n,t,r);return await Promise.all(n.filter(i=>!o.includes(i)).map(async({api:i})=>i.close())),[...e.filter(i=>i.info.type!=="iab"),...o]},m$=(e,t,r)=>t==null?[]:e.filter(n=>n.info.metadata?.codexSessionId===t&&(r==null||n.info.metadata.codexAppBuildFlavor===r));function eg(e){return e}function cd(e){return e==="extension"||e==="iab"||e==="cdp"}function dd(e){return e}function lk({browserId:e,clientInfo:t,requestedBrowserId:r}){return cd(r)?eg(t.type)===r:e===r}async function executeAgentCommand(l){let i=[],n={};let{type:d,...p}=l;if("browser_id"in p){if(cd(p.browser_id)){let h=dd(p.browser_id);tg(h)||hk({diagnostics:n,reason:"backend-disabled",requestedBrowserId:p.browser_id}),ck(h)}let f=i.find(h=>lk({browserId:h.browserId,clientInfo:h.clientInfo,requestedBrowserId:p.browser_id}));}}
+JS
+    node "$REPO_DIR/scripts/lib/patch-chrome-plugin.js" "$chrome_dir" >/dev/null 2>&1
+    assert_contains "$browser_client" "codexLinuxChromeUserDataDirectories"
+    assert_contains "$browser_client" '"BraveSoftware","Brave-Browser"'
+    assert_contains "$browser_client" '".config","chromium"'
+    assert_contains "$browser_client" 'async(e,t,r=ld)'
+    assert_contains "$browser_client" "instanceId:await ZA(o.id,e,r)"
+    assert_contains "$browser_client" "codexLinuxRankBrowserBackends"
+    assert_contains "$browser_client" "codexLinuxFilterBrowserBackends"
+    assert_contains "$browser_client" "p$.platform()"
+    assert_not_contains "$browser_client" "codexLinuxRejectAmbiguousBrowserAlias"
 }
 
 test_chrome_marketplace_fallback_synthesis() {
