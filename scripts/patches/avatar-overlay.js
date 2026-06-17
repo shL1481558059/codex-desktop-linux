@@ -24,15 +24,15 @@ function findAvatarMethod(source, signatureRegex) {
   };
 }
 
-function findAvatarMethodAfter(source, signatureRegex, startIndex) {
-  const match = source.slice(startIndex).match(signatureRegex);
+function findAvatarMethodAfter(source, signatureRegex, startIndex, endIndex = source.length) {
+  const match = source.slice(startIndex, endIndex).match(signatureRegex);
   if (match == null) {
     return null;
   }
   const absoluteIndex = startIndex + match.index;
   const openIndex = absoluteIndex + match[0].length - 1;
   const closeIndex = findMatchingBrace(source, openIndex);
-  if (closeIndex === -1) {
+  if (closeIndex === -1 || closeIndex + 1 > endIndex) {
     return null;
   }
   return {
@@ -52,8 +52,38 @@ function avatarOverlayRegionStart(source) {
   return stateMessageIndex === -1 ? 0 : stateMessageIndex;
 }
 
+function findAvatarOverlayClass(source) {
+  const classRegex = /class(?:\s+[A-Za-z_$][\w$]*)?(?:\s+extends\s+[A-Za-z_$][\w$.]*)?\{/g;
+  classRegex.lastIndex = avatarOverlayRegionStart(source);
+  let match;
+  while ((match = classRegex.exec(source)) != null) {
+    const openIndex = match.index + match[0].length - 1;
+    const closeIndex = findMatchingBrace(source, openIndex);
+    if (closeIndex === -1) {
+      return null;
+    }
+    const text = source.slice(match.index, closeIndex + 1);
+    if (
+      text.includes("appearance:`avatarOverlay`") ||
+      text.includes("avatar-overlay-open-state-changed")
+    ) {
+      return {
+        start: match.index,
+        end: closeIndex + 1,
+        text,
+      };
+    }
+    classRegex.lastIndex = closeIndex + 1;
+  }
+  return null;
+}
+
 function findAvatarOverlayMethod(source, signatureRegex) {
-  return findAvatarMethodAfter(source, signatureRegex, avatarOverlayRegionStart(source));
+  const overlayClass = findAvatarOverlayClass(source);
+  if (overlayClass == null) {
+    return null;
+  }
+  return findAvatarMethodAfter(source, signatureRegex, overlayClass.start, overlayClass.end);
 }
 
 function replaceAvatarMethod(source, signatureRegex, replacement) {
