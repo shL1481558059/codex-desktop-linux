@@ -251,6 +251,15 @@ function syntheticChromeBrowserClientBundle() {
   ].join("");
 }
 
+function syntheticCurrentChromeBrowserClientBundle() {
+  return [
+    "var CN=[\"chrome\",\"iab\",\"cdp\"];function m_(e){return CN.some(t=>t===e)}",
+    "var y_=\"BROWSER_USE_AVAILABLE_BACKENDS\";",
+    "function nl(e){return globalThis[e]??null}function F_(e){return Array.isArray(e)?e:String(e).split(\",\")}",
+    "function N_(){let e=nl(y_);return e==null?null:F_(e).filter(m_)}",
+  ].join("");
+}
+
 function syntheticAppServerManagerSignalsBundle() {
   return [
     "function Of({conversationId:e,conversations:t,getWorkspaceBrowserRoot:n,getWorkspaceKind:r,hostId:i,setConversation:a,thread:o,threadsById:s,updateConversationState:c}){let h=o.status??null;if(t.has(e)){c(e,e=>{e.resumeState===`needs_resume`&&(e.threadRuntimeStatus=h)});return}}",
@@ -284,6 +293,14 @@ function syntheticAppMainEnablementBridgeBundle() {
   return [
     "var DF=`[remote-connections/slingshot-gate-bridge]`;",
     "function OF(){let e=(0,Z.c)(3),t=sc(),n,r;return e[0]===t?(n=e[1],r=e[2]):(n=()=>{$o(`set-remote-control-connections-enabled`,{params:{enabled:t}}).catch(e=>{q.warning(`${DF} sync_failed`,{safe:{enabled:t},sensitive:{error:e}})})},r=[t],e[0]=t,e[1]=n,e[2]=r),(0,Q.useEffect)(n,r),null}",
+  ].join("");
+}
+
+function syntheticCurrentAppMainEnablementBridgeBundle() {
+  return [
+    "var fH=`[remote-connections/slingshot-gate-bridge]`;",
+    "function mH(){let e=(0,Q.c)(6),{checkGate:t,isLoading:n}=eo(),r;e[0]===t?r=e[1]:(r=t(`1042620455`),e[0]=t,e[1]=r);let i=r,a,o;return e[2]!==n||e[3]!==i?(a=()=>{n||qt(`set-remote-control-connections-enabled`,{params:{enabled:i}}).catch(e=>{Y.warning(`${fH} sync_failed`,{safe:{slingshotEnabled:i},sensitive:{error:e}})})},o=[n,i],e[2]=n,e[3]=i,e[4]=a,e[5]=o):(a=e[4],o=e[5]),(0,$.useEffect)(a,o),null}",
+    "var handlers={\"set-remote-control-enabled-for-host\":pU((e,{enabled:t})=>e.sendRequest(t?`remoteControl/enable`:`remoteControl/disable`,null))};",
   ].join("");
 }
 
@@ -1380,6 +1397,24 @@ test("Linux remote mobile Chrome bridge patch preserves Chrome when backends con
   assert.deepEqual([...context.module.exports()], ["chrome", "iab"]);
 });
 
+test("Linux remote mobile Chrome bridge patch handles current browser-client backend allowlist shape", () => {
+  const source = syntheticCurrentChromeBrowserClientBundle();
+  const patched = applyLinuxRemoteMobileChromeBridgePatch(source);
+
+  assert.notEqual(patched, source);
+  assert.match(patched, /codexLinuxRemoteMobileBrowserBackends/);
+  assert.match(patched, /function N_\(\)\{let e=nl\(y_\);return codexLinuxRemoteMobileBrowserBackends/);
+  assert.equal(applyLinuxRemoteMobileChromeBridgePatch(patched), patched);
+
+  const context = {
+    BROWSER_USE_AVAILABLE_BACKENDS: ["iab"],
+    module: { exports: {} },
+    process: { platform: "linux" },
+  };
+  vm.runInNewContext(`${patched};module.exports=N_;`, context);
+  assert.deepEqual([...context.module.exports()], ["chrome", "iab"]);
+});
+
 test("Linux remote mobile Chrome bridge patch warns when browser-client needles drift", () => {
   const source = "var e2=[\"chrome\",\"iab\",\"cdp\"];function ly(e){return e2.some(t=>t===e)}";
   const { result, warnings } = captureWarnings(() => applyLinuxRemoteMobileChromeBridgePatch(source));
@@ -1646,6 +1681,41 @@ test("Linux remote-control enablement bridge loads remote-control clients on Lin
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "set-remote-control-connections-enabled");
   assert.equal(calls[0].params.enabled, true);
+});
+
+test("Linux remote-control enablement bridge omits params for current host toggle handler", async () => {
+  const source = syntheticCurrentAppMainEnablementBridgeBundle();
+  const patched = applyLinuxRemoteControlEnablementBridgePatch(source);
+
+  assert.notEqual(patched, source);
+  assert.match(patched, /codexLinuxRemoteControlEnableForHostParams/);
+  assert.doesNotMatch(patched, /remoteControl\/disable`,null/);
+  assert.equal(applyLinuxRemoteControlEnablementBridgePatch(patched), patched);
+
+  const calls = [];
+  const context = {
+    pU: (handler) => handler,
+    host: {
+      sendRequest(method, params) {
+        calls.push({ method, params });
+        return Promise.resolve({ status: "enabled" });
+      },
+    },
+  };
+  await vm.runInNewContext(`${patched};handlers["set-remote-control-enabled-for-host"](host,{enabled:true});`, context);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "remoteControl/enable");
+  assert.equal(calls[0].params, undefined);
+});
+
+test("Linux remote-control enablement bridge warns when host toggle params needle drifts", () => {
+  const source =
+    "var handlers={\"set-remote-control-enabled-for-host\":pU((e,{enabled:t})=>e.sendRequest((t?`remoteControl/enable`:`remoteControl/disable`),null))};";
+  const { result, warnings } = captureWarnings(() => applyLinuxRemoteControlEnablementBridgePatch(source));
+
+  assert.equal(result, source);
+  assert.ok(warnings.some((warning) => warning.includes("enable-for-host params needle")));
 });
 
 test("Linux remote-control enablement bridge migrates old auto-connect cleanup patch", () => {
