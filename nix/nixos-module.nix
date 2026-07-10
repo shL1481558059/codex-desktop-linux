@@ -10,16 +10,11 @@ let
   remoteCfg = cfg.remoteControl;
   system = pkgs.stdenv.hostPlatform.system;
   flakePackages = self.packages.${system};
-  packageName =
-    if cfg.remoteMobileControl.enable && cfg.computerUseUi.enable then
-      "codex-desktop-computer-use-ui-remote-mobile-control"
-    else if cfg.remoteMobileControl.enable then
-      "codex-desktop-remote-mobile-control"
-    else if cfg.computerUseUi.enable then
-      "codex-desktop-computer-use-ui"
-    else
-      "codex-desktop";
-  basePackage = if cfg.package != null then cfg.package else flakePackages.${packageName};
+  linuxFeatures = import ./linux-features.nix { inherit lib; };
+  packageSelection = import ./package-selection.nix {
+    inherit cfg flakePackages lib;
+  };
+  basePackage = packageSelection.package;
   codexCliPackage =
     if cfg.cliPackage != null then
       cfg.cliPackage
@@ -86,10 +81,13 @@ in
         inputs.codex-desktop-linux.packages.''${pkgs.stdenv.hostPlatform.system}.codex-desktop
       '';
       description = ''
-        ChatGPT Desktop package to install. When unset, the module selects one of
-        this flake's package variants from
+        ChatGPT Desktop package to install. When unset, the module builds the
+        selected configuration from
         {option}`programs.codexDesktopLinux.computerUseUi.enable` and
-        {option}`programs.codexDesktopLinux.remoteMobileControl.enable`.
+        {option}`programs.codexDesktopLinux.linuxFeatures`. The
+        {option}`programs.codexDesktopLinux.remoteMobileControl.enable` option
+        remains a compatibility shorthand for the `remote-mobile-control`
+        feature.
       '';
     };
 
@@ -120,6 +118,22 @@ in
     computerUseUi.enable = lib.mkEnableOption "the Linux Computer Use UI package variant";
 
     remoteMobileControl.enable = lib.mkEnableOption "the experimental Linux mobile remote-control package variant";
+
+    linuxFeatures = lib.mkOption {
+      type = linuxFeatures.optionType;
+      default = [ ];
+      example = [
+        "appshots"
+        "open-target-discovery"
+      ];
+      description = ''
+        Nix-compatible optional Linux features to include in the package. IDs
+        are deduplicated and sorted before the package derivation is created.
+        Features not supported by the Nix packaging layer fail module
+        evaluation. This option does not affect an explicitly configured
+        {option}`programs.codexDesktopLinux.package`.
+      '';
+    };
 
     remoteControl = {
       enable = lib.mkEnableOption "a system-wide user app-server unit with remote control enabled";

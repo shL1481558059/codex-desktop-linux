@@ -169,7 +169,9 @@ sed -n '1,220p' ~/.cache/codex-desktop/launcher.log
 ## Feature Outputs
 
 Flakes do not include the git-ignored `linux-features/features.json` opt-in
-file, so Nix exposes feature-specific app variants.
+file. Nix therefore keeps the existing cache-friendly feature outputs and also
+lets module users select Linux features that have been verified to build
+hermetically.
 
 Remote mobile control:
 
@@ -189,6 +191,22 @@ Computer Use UI only:
 nix run github:ilysenko/codex-desktop-linux#codex-desktop-computer-use-ui
 ```
 
+The Home Manager and NixOS modules accept these feature IDs through
+`programs.codexDesktopLinux.linuxFeatures`:
+
+| Feature ID | Purpose |
+| --- | --- |
+| `appshots` | Linux AppShots capture integration |
+| `node-repl-reaper` | Cleanup for leaked Browser Use `node_repl` helpers |
+| `open-target-discovery` | Linux terminal, editor, and file-manager discovery |
+| `persistent-status-panel` | Persistent `/status` panel state |
+| `remote-mobile-control` | Experimental mobile remote-control host enrollment |
+
+The list is validated during module evaluation, then deduplicated and sorted so
+equivalent configurations produce the same derivation. Features that are not in
+this Nix allowlist remain available through the regular opt-in feature flow but
+cannot be selected from a pure flake configuration.
+
 ## Home Manager / NixOS Module
 
 For a declarative install with the mobile remote-control app-server managed by
@@ -204,10 +222,21 @@ systemd instead of the Desktop launcher:
     enable = true;
     computerUseUi.enable = true;
     remoteMobileControl.enable = true;
+    linuxFeatures = [
+      "appshots"
+      "open-target-discovery"
+    ];
     remoteControl.enable = true;
   };
 }
 ```
+
+`remoteMobileControl.enable` remains a compatibility shorthand for adding
+`remote-mobile-control` to the normalized feature list. `computerUseUi.enable`
+remains a dedicated option because it selects the Computer Use UI package path.
+The existing named package outputs use the same package builder with fixed
+arguments. Setting `programs.codexDesktopLinux.package` still selects that
+package directly and takes precedence over module-driven feature selection.
 
 This installs the selected ChatGPT Desktop package variant and starts a user
 `codex-remote-control.service` with:

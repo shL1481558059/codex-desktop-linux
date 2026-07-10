@@ -63,6 +63,7 @@
             in
               !(pkgs.lib.hasSuffix "/.codex" pathStr || pkgs.lib.hasInfix "/.codex/" pathStr));
         };
+        nixLinuxFeatures = import ./nix/linux-features.nix { lib = pkgs.lib; };
         computerUseBuildSource = pkgs.runCommandLocal "codex-computer-use-linux-source" { } ''
           mkdir -p "$out"
           cp ${./Cargo.lock} "$out/Cargo.lock"
@@ -391,7 +392,8 @@ PY
           });
 
         enabledFeatureIds = { enableComputerUseUi ? false, linuxFeatureIds ? [ ] }:
-          pkgs.lib.optionals enableComputerUseUi [ "computer-use-ui" ] ++ linuxFeatureIds;
+          pkgs.lib.optionals enableComputerUseUi [ "computer-use-ui" ]
+          ++ nixLinuxFeatures.normalize linuxFeatureIds;
 
         packageSuffix = args:
           let
@@ -482,11 +484,16 @@ PY
           '';
         };
 
-        mkCodexDesktop = { enableComputerUseUi ? false, linuxFeatureIds ? [ ] }:
+        buildCodexDesktop = { enableComputerUseUi ? false, linuxFeatureIds ? [ ] }:
         let
-          featureArgs = { inherit enableComputerUseUi linuxFeatureIds; };
+          normalizedLinuxFeatureIds = nixLinuxFeatures.normalize linuxFeatureIds;
+          featureArgs = {
+            inherit enableComputerUseUi;
+            linuxFeatureIds = normalizedLinuxFeatureIds;
+          };
           payload = mkCodexDesktopPayload {
-            inherit enableComputerUseUi linuxFeatureIds;
+            inherit enableComputerUseUi;
+            linuxFeatureIds = normalizedLinuxFeatureIds;
           };
         in
         pkgs.stdenv.mkDerivation {
@@ -566,19 +573,28 @@ PY
           };
         };
 
-        codexDesktop = mkCodexDesktop { };
+        codexDesktop = pkgs.lib.makeOverridable buildCodexDesktop { };
 
-        codexDesktopComputerUseUi = mkCodexDesktop {
+        codexDesktopComputerUseUi = codexDesktop.override {
           enableComputerUseUi = true;
         };
 
-        codexDesktopRemoteMobileControl = mkCodexDesktop {
+        codexDesktopRemoteMobileControl = codexDesktop.override {
           linuxFeatureIds = [ "remote-mobile-control" ];
         };
 
-        codexDesktopComputerUseUiRemoteMobileControl = mkCodexDesktop {
+        codexDesktopComputerUseUiRemoteMobileControl = codexDesktop.override {
           enableComputerUseUi = true;
           linuxFeatureIds = [ "remote-mobile-control" ];
+        };
+
+        codexDesktopNixFeatureCheck = codexDesktop.override {
+          linuxFeatureIds = [
+            "appshots"
+            "node-repl-reaper"
+            "open-target-discovery"
+            "persistent-status-panel"
+          ];
         };
 
         installer = pkgs.writeShellApplication {
@@ -630,6 +646,13 @@ PY
           codex-desktop-remote-mobile-control = codexDesktopRemoteMobileControl;
           codex-desktop-computer-use-ui-remote-mobile-control = codexDesktopComputerUseUiRemoteMobileControl;
           installer = installer;
+        };
+
+        checks = {
+          nix-linux-features-evaluation = import ./nix/linux-features-test.nix {
+            inherit pkgs self system;
+          };
+          nix-linux-features-multi-feature = codexDesktopNixFeatureCheck;
         };
 
         apps.default = {

@@ -525,7 +525,7 @@ run_nix_job_as_root() {
 
     append_summary "Nix Validation" \
         "Flake check passed." \
-        "Built .#codex-desktop and .#installer without result links."
+        "Built the Nix checks, .#codex-desktop, and .#installer without result links."
 }
 
 run_job_as_current_user() {
