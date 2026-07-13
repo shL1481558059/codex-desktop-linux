@@ -973,6 +973,7 @@ test("default core patch descriptors are grouped and unique", () => {
     "subagent-nickname-metadata-shape",
     "local-environment-action-modal-draft",
     "linux-computer-use-ui-availability",
+    "linux-computer-use-settings-availability",
     "linux-computer-use-install-flow",
     "linux-app-updater-bridge",
     "browser-annotation-screenshot",
@@ -7486,17 +7487,63 @@ test("keeps object-helper Computer Use host compatibility on Linux when platform
   );
 });
 
-test("Computer Use availability descriptor matches the current settings bundle name", () => {
-  const [descriptor] = require("./patches/core/all-linux/webview/computer-use-ui/patch.js");
-
-  assert.match("computer-use-settings-B1QCeMSP.js", descriptor.pattern);
-  assert.match(
-    "app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~~gpgl9un5-_t04Xpau.js",
-    descriptor.pattern,
+test("Computer Use availability descriptors track main and settings bundles separately", () => {
+  const descriptors = require("./patches/core/all-linux/webview/computer-use-ui/patch.js");
+  const mainDescriptor = descriptors.find(
+    (descriptor) => descriptor.id === "linux-computer-use-ui-availability",
   );
-  assert.doesNotMatch("use-model-settings-5PHNqYL4.js", descriptor.pattern);
-  assert.doesNotMatch("use-is-plugins-enabled-current.js", descriptor.pattern);
-  assert.doesNotMatch("use-native-apps.electron-DhuUEit1.js", descriptor.pattern);
+  const settingsDescriptor = descriptors.find(
+    (descriptor) => descriptor.id === "linux-computer-use-settings-availability",
+  );
+
+  assert.match("computer-use-settings-B1QCeMSP.js", settingsDescriptor.pattern);
+  assert.doesNotMatch("computer-use-settings-B1QCeMSP.js", mainDescriptor.pattern);
+  assert.match(
+    "app-initial~app-main~quick-chat-window-page~work-home-page~chatgpt-conversation-page-BqLP6EDd.js",
+    mainDescriptor.pattern,
+  );
+  assert.doesNotMatch(
+    "app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~~gpgl9un5-_t04Xpau.js",
+    mainDescriptor.pattern,
+  );
+  assert.doesNotMatch("use-model-settings-5PHNqYL4.js", settingsDescriptor.pattern);
+  assert.doesNotMatch("use-is-plugins-enabled-current.js", settingsDescriptor.pattern);
+  assert.doesNotMatch("use-native-apps.electron-DhuUEit1.js", settingsDescriptor.pattern);
+});
+
+test("Computer Use patch report does not hide a missing main availability bundle", () => {
+  withIsolatedHome(() => {
+    process.env[COMPUTER_USE_UI_ENV_VAR] = "1";
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-computer-use-main-report-"));
+    try {
+      const buildDir = path.join(tempRoot, ".vite", "build");
+      const assetsDir = path.join(tempRoot, "webview", "assets");
+      fs.mkdirSync(buildDir, { recursive: true });
+      fs.mkdirSync(assetsDir, { recursive: true });
+      fs.writeFileSync(path.join(buildDir, "main.js"), "const app = true;");
+      fs.writeFileSync(
+        path.join(assetsDir, "computer-use-settings-current.js"),
+        "let availability=useAvailability(arg),{platform:platform}=usePlatform();" +
+          "let props={computerUseAvailability:availability,platform:platform};" +
+          "availability.available&&render(props);",
+      );
+      fs.writeFileSync(path.join(tempRoot, "package.json"), JSON.stringify({ name: "codex" }));
+
+      const report = createPatchReport();
+      patchExtractedApp(tempRoot, { report });
+
+      assert.equal(
+        report.patches.find((patch) => patch.name === "linux-computer-use-ui-availability")?.status,
+        "skipped-optional",
+      );
+      assert.equal(
+        report.patches.find((patch) => patch.name === "linux-computer-use-settings-availability")?.status,
+        "applied",
+      );
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 test("keeps current Computer Use settings availability enabled on Linux", () => {
@@ -8492,7 +8539,7 @@ test("patchExtractedApp scans current Computer Use settings bundles when UI is e
       fs.writeFileSync(
         path.join(
           assetsDir,
-          "app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~~gpgl9un5-_t04Xpau.js",
+          "app-initial~app-main~quick-chat-window-page~work-home-page~chatgpt-conversation-page-BqLP6EDd.js",
         ),
         "function gct(e){return e===`macOS`||e===`windows`}" +
           "function yct(e){let t=(0,Sp.c)(16),{enabled:n,hostId:r}=e,i=n===void 0?!0:n,{isLoading:a,platform:o}=ba(),s=gr(`1506311413`),c;t[0]===r?c=t[1]:(c={featureName:`computer_use`,hostId:r},t[0]=r,t[1]=c);let l=mp(c),u=o===`windows`&&!a,d=i&&u,f;t[2]===d?f=t[3]:(f={enabled:d},t[2]=d,t[3]=f);let p=yp(f),m=l.isLoading||u&&p.isLoading,h=l.enabled&&(!u||p.enabled),g;t[4]!==h||t[5]!==i||t[6]!==m||t[7]!==s||t[8]!==a||t[9]!==o?(g=xp({areRequiredFeaturesEnabled:h,enabled:i,isAnyFeatureLoading:m,isComputerUseGateEnabled:s,isHostCompatiblePlatform:gct(o),isPlatformLoading:a,windowType:`electron`}),t[4]=h,t[5]=i,t[6]=m,t[7]=s,t[8]=a,t[9]=o,t[10]=g):g=t[10];return g}",
@@ -8533,7 +8580,7 @@ test("patchExtractedApp scans current Computer Use settings bundles when UI is e
         fs.readFileSync(
           path.join(
             assetsDir,
-            "app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~~gpgl9un5-_t04Xpau.js",
+            "app-initial~app-main~quick-chat-window-page~work-home-page~chatgpt-conversation-page-BqLP6EDd.js",
           ),
           "utf8",
         ),
