@@ -677,8 +677,14 @@ fn readiness_report(
         );
     }
 
-    let recommended_next_step = if !can_build_accessibility_tree {
+    let recommended_next_step = if !can_build_accessibility_tree && is_gnome_platform(platform) {
         "Run setup_accessibility to enable AT-SPI accessibility before element-aware actions."
+            .to_string()
+    } else if !can_build_accessibility_tree && can_send_development_input {
+        "AT-SPI is unavailable on this desktop; continue with screenshots and coordinate input. Install and enable the desktop AT-SPI service only if element-aware actions are required."
+            .to_string()
+    } else if !can_build_accessibility_tree {
+        "AT-SPI and development input are unavailable. Install and enable the desktop AT-SPI service for element-aware actions, or enable a supported input backend for screenshot-based coordinate actions."
             .to_string()
     } else if !can_query_windows {
         format!(
@@ -709,6 +715,17 @@ fn readiness_report(
         recommended_next_step,
         blockers,
     }
+}
+
+fn is_gnome_platform(platform: &PlatformReport) -> bool {
+    platform
+        .xdg_current_desktop
+        .as_deref()
+        .is_some_and(|desktop| desktop.to_ascii_lowercase().contains("gnome"))
+        || platform
+            .desktop_session
+            .as_deref()
+            .is_some_and(|desktop| desktop.to_ascii_lowercase().contains("gnome"))
 }
 
 fn can_send_development_input(portals: &PortalReport, input: &InputReport) -> bool {
@@ -1185,6 +1202,37 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("Exact window activation")));
+    }
+
+    #[test]
+    fn deepin_without_at_spi_continues_with_screenshot_coordinate_mode() {
+        let mut platform = platform_report();
+        platform.desktop_session = Some("deepin".to_string());
+        platform.xdg_current_desktop = Some("DDE".to_string());
+        platform.xdg_session_type = Some("x11".to_string());
+        let accessibility = accessibility_report(
+            Check::fail("org.a11y.Bus service missing"),
+            Check::ok("true"),
+        );
+        let windowing = windowing_report(false, false);
+        let input = input_report(false);
+
+        let readiness = readiness_report(
+            &platform,
+            &portal_report(Check::ok("org.freedesktop.portal.RemoteDesktop")),
+            &accessibility,
+            &windowing,
+            &input,
+        );
+
+        assert!(!readiness.can_build_accessibility_tree);
+        assert!(readiness.can_send_development_input);
+        assert!(readiness
+            .recommended_next_step
+            .contains("continue with screenshots and coordinate input"));
+        assert!(!readiness
+            .recommended_next_step
+            .contains("setup_accessibility"));
     }
 
     #[test]

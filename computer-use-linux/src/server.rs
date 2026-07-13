@@ -231,7 +231,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Screenshot results include coordinate_width, coordinate_height, scale, format, and quality when the returned image is downscaled or compressed; callers can request jpeg/quality for compression before resizing.",
+        description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Use the default PNG on the first call and omit format/quality unless compression is necessary. Tool arguments must be strict JSON; JPEG must be written as the string value \"jpeg\", for example {\"format\":\"jpeg\",\"quality\":70}.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -265,26 +265,28 @@ impl ComputerUseLinux {
         } else {
             (None, None)
         };
-        let (accessibility_tree, accessibility_tree_raw_count, accessibility_error) =
-            if diagnostics.readiness.can_build_accessibility_tree {
-                let target_pid = window_context.as_ref().and_then(|window| window.pid);
-                match snapshot_tree(app_filter.as_deref(), target_pid, max_nodes, max_depth).await {
-                    Ok(nodes) => {
-                        let raw_count = nodes.len();
-                        (compact_accessibility_tree(nodes), raw_count, None)
-                    }
-                    Err(error) => (Vec::new(), 0, Some(format!("{error:#}"))),
+        let (accessibility_tree, accessibility_tree_raw_count, accessibility_error) = if diagnostics
+            .readiness
+            .can_build_accessibility_tree
+        {
+            let target_pid = window_context.as_ref().and_then(|window| window.pid);
+            match snapshot_tree(app_filter.as_deref(), target_pid, max_nodes, max_depth).await {
+                Ok(nodes) => {
+                    let raw_count = nodes.len();
+                    (compact_accessibility_tree(nodes), raw_count, None)
                 }
-            } else {
-                (
+                Err(error) => (Vec::new(), 0, Some(format!("{error:#}"))),
+            }
+        } else {
+            (
                     Vec::new(),
                     0,
                     Some(
-                        "GNOME accessibility is disabled; call setup_accessibility first."
+                        "AT-SPI accessibility is unavailable. Continue with screenshot and coordinate actions when readiness reports an input backend; follow readiness.recommended_next_step if element-aware actions are required."
                             .to_string(),
                     ),
                 )
-            };
+        };
         if accessibility_error.is_none() {
             self.cache_nodes(&accessibility_tree);
         } else {
@@ -352,7 +354,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "screenshot",
-        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Returns the image plus a short caption with returned dimensions, coordinate dimensions, scale, format, quality, source, and crop bounds; callers can request jpeg/quality for compression before resizing.",
+        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Use default PNG unless compression is necessary. Tool arguments must be strict JSON; JPEG must be written as the string value \"jpeg\", for example {\"format\":\"jpeg\",\"quality\":70}.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1303,7 +1305,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.3.1-linux-alpha1",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state with only the needed app/window selectors; keep the first call on the default PNG and omit format/quality. Tool arguments must always be strict JSON. Enum values such as jpeg and png are JSON strings: use {\"format\":\"jpeg\",\"quality\":70}, never a bare value such as {\"format\":jpeg}. If a tool call reports a JSON argument parse error, retry it once with strict JSON instead of ending the task. If diagnostics report disabled accessibility on GNOME, call setup_accessibility before asking the user to retry. If AT-SPI is unavailable on a non-GNOME desktop such as Deepin, do not repeatedly call setup_accessibility; continue with screenshots and coordinate input when readiness confirms an input backend. Use list_windows/focused_window before targeted keyboard input when window introspection is available. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, a strict JSON format string, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -1476,7 +1478,7 @@ struct GetAppStateParams {
     /// Additional downscale factor from 0.0 to 1.0, applied before max dimensions.
     #[serde(default)]
     scale: Option<f32>,
-    /// Output image format (default png). Use jpeg with quality to trade exact pixels for smaller payloads.
+    /// Output image format (default png). JSON callers must quote "jpeg" or "png".
     #[serde(default)]
     format: Option<ScreenshotOutputFormat>,
     /// JPEG quality from 1 to 95 (default 80). Ignored for png.
@@ -1547,7 +1549,7 @@ struct ScreenshotParams {
     /// Additional downscale factor from 0.0 to 1.0, applied before max dimensions.
     #[serde(default)]
     scale: Option<f32>,
-    /// Output image format (default png). Use jpeg with quality to trade exact pixels for smaller payloads.
+    /// Output image format (default png). JSON callers must quote "jpeg" or "png".
     #[serde(default)]
     format: Option<ScreenshotOutputFormat>,
     /// JPEG quality from 1 to 95 (default 80). Ignored for png.
