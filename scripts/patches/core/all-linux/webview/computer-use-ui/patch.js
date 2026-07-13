@@ -15,7 +15,7 @@ module.exports = [
     order: 1100,
     ciPolicy: "opt-in",
     enabled: (context) => context.enableComputerUseUi,
-    pattern: /^computer-use-settings.*\.js$/,
+    pattern: /^(?:computer-use-settings.*|app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~.*)\.js$/,
     missingDescription: "Computer Use availability bundle",
     skipDescription: "Linux Computer Use UI availability patch",
     apply: applyLinuxComputerUseRendererAvailabilityPatch,

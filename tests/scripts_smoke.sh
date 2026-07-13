@@ -8451,7 +8451,7 @@ test_linux_computer_use_ui_opt_in_smoke() {
     local output_log="$workspace/output.log"
     local main_bundle="$extracted/.vite/build/main-test.js"
     local renderer_asset="$extracted/webview/assets/computer-use-settings-renderer-test.js"
-    local current_renderer_asset="$extracted/webview/assets/computer-use-settings-current-test.js"
+    local current_renderer_asset="$extracted/webview/assets/app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~~gpgl9un5-_t04Xpau.js"
     local install_flow_asset="$extracted/webview/assets/app-initial~app-main~onboarding-page~hotkey-window-thread-page~quick-chat-window-page~chatg~gwqc41kz-test.js"
     local native_apps_asset="$extracted/webview/assets/computer-use-settings-native-apps-test.js"
     local bundle_body

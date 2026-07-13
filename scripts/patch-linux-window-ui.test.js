@@ -7490,6 +7490,10 @@ test("Computer Use availability descriptor matches the current settings bundle n
   const [descriptor] = require("./patches/core/all-linux/webview/computer-use-ui/patch.js");
 
   assert.match("computer-use-settings-B1QCeMSP.js", descriptor.pattern);
+  assert.match(
+    "app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~~gpgl9un5-_t04Xpau.js",
+    descriptor.pattern,
+  );
   assert.doesNotMatch("use-model-settings-5PHNqYL4.js", descriptor.pattern);
   assert.doesNotMatch("use-is-plugins-enabled-current.js", descriptor.pattern);
   assert.doesNotMatch("use-native-apps.electron-DhuUEit1.js", descriptor.pattern);
@@ -8485,6 +8489,14 @@ test("patchExtractedApp scans current Computer Use settings bundles when UI is e
         "function _p(e){return e===`macOS`||e===`windows`}" +
           "function vp(e){let t=(0,Sp.c)(16),{enabled:n,hostId:r}=e,i=n===void 0?!0:n,{isLoading:a,platform:o}=ba(),s=gr(`1506311413`),c;t[0]===r?c=t[1]:(c={featureName:`computer_use`,hostId:r},t[0]=r,t[1]=c);let l=mp(c),u=o===`windows`&&!a,d=i&&u,f;t[2]===d?f=t[3]:(f={enabled:d},t[2]=d,t[3]=f);let p=yp(f),m=l.isLoading||u&&p.isLoading,h=l.enabled&&(!u||p.enabled),g;t[4]!==h||t[5]!==i||t[6]!==m||t[7]!==s||t[8]!==a||t[9]!==o?(g=xp({areRequiredFeaturesEnabled:h,enabled:i,isAnyFeatureLoading:m,isComputerUseGateEnabled:s,isHostCompatiblePlatform:_p(o),isPlatformLoading:a,windowType:`electron`}),t[4]=h,t[5]=i,t[6]=m,t[7]=s,t[8]=a,t[9]=o,t[10]=g):g=t[10];return g}",
       );
+      fs.writeFileSync(
+        path.join(
+          assetsDir,
+          "app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~~gpgl9un5-_t04Xpau.js",
+        ),
+        "function gct(e){return e===`macOS`||e===`windows`}" +
+          "function yct(e){let t=(0,Sp.c)(16),{enabled:n,hostId:r}=e,i=n===void 0?!0:n,{isLoading:a,platform:o}=ba(),s=gr(`1506311413`),c;t[0]===r?c=t[1]:(c={featureName:`computer_use`,hostId:r},t[0]=r,t[1]=c);let l=mp(c),u=o===`windows`&&!a,d=i&&u,f;t[2]===d?f=t[3]:(f={enabled:d},t[2]=d,t[3]=f);let p=yp(f),m=l.isLoading||u&&p.isLoading,h=l.enabled&&(!u||p.enabled),g;t[4]!==h||t[5]!==i||t[6]!==m||t[7]!==s||t[8]!==a||t[9]!==o?(g=xp({areRequiredFeaturesEnabled:h,enabled:i,isAnyFeatureLoading:m,isComputerUseGateEnabled:s,isHostCompatiblePlatform:gct(o),isPlatformLoading:a,windowType:`electron`}),t[4]=h,t[5]=i,t[6]=m,t[7]=s,t[8]=a,t[9]=o,t[10]=g):g=t[10];return g}",
+      );
       fs.writeFileSync(path.join(tempRoot, "package.json"), JSON.stringify({ name: "codex" }));
 
       patchExtractedApp(tempRoot);
@@ -8516,6 +8528,16 @@ test("patchExtractedApp scans current Computer Use settings bundles when UI is e
           "utf8",
         ),
         /g=xp\(\{areRequiredFeaturesEnabled:h,enabled:i,isAnyFeatureLoading:m,isComputerUseGateEnabled:s,isHostCompatiblePlatform:o===`linux`\|\|_p\(o\),isPlatformLoading:a,windowType:`electron`\}\)/,
+      );
+      assert.match(
+        fs.readFileSync(
+          path.join(
+            assetsDir,
+            "app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~~gpgl9un5-_t04Xpau.js",
+          ),
+          "utf8",
+        ),
+        /g=xp\(\{areRequiredFeaturesEnabled:o===`linux`\|\|h,enabled:i,isAnyFeatureLoading:o===`linux`\?!1:m,isComputerUseGateEnabled:o===`linux`\|\|s,isHostCompatiblePlatform:o===`linux`\|\|gct\(o\),isPlatformLoading:a,windowType:`electron`\}\)/,
       );
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
