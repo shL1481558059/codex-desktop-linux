@@ -80,6 +80,10 @@ Ad hoc, for one build:
 CODEX_LINUX_ENABLE_COMPUTER_USE_UI=1 make build-app
 ```
 
+For a self-built GitHub Actions package, set the same environment variable on
+the step that runs `make build-app`. Setting it only on the later package step
+is too late because the webview patches are applied while the app is generated.
+
 Persistent, including future auto-updater rebuilds:
 
 ```bash

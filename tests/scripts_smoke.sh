@@ -5943,8 +5943,8 @@ EOF
     assert_contains "$REPO_DIR/scripts/lib/node-runtime.sh" "MANAGED_NODE_VERSION"
     assert_contains "$REPO_DIR/scripts/lib/package-common.sh" "node-runtime"
     assert_contains "$REPO_DIR/tests/fixtures/create-packaged-app-fixture.sh" "resources/node-runtime/bin"
-    assert_contains "$REPO_DIR/.github/workflows/ci.yml" "tests/fixtures/create-packaged-app-fixture.sh codex-app"
-    assert_contains "$REPO_DIR/.github/workflows/ci.yml" "bash scripts/ci/run-node-checks.sh"
+    assert_contains "$REPO_DIR/.github/workflows/build.yml" "bash tests/scripts_smoke.sh"
+    assert_contains "$REPO_DIR/.github/workflows/build.yml" "CODEX_LINUX_ENABLE_COMPUTER_USE_UI: '1'"
     assert_contains "$REPO_DIR/scripts/ci/container-entrypoint.sh" "bash scripts/ci/run-node-checks.sh"
     assert_contains "$REPO_DIR/scripts/ci/run-node-checks.sh" "git ls-files '\\*.js'"
     assert_contains "$REPO_DIR/scripts/ci/run-node-checks.sh" "git ls-files '\\*.test.js' 'linux-features/\\*/test.js'"
@@ -6953,34 +6953,117 @@ for (const [name, plugin] of byName) {
 NODE
 }
 
-test_browser_use_node_repl_glibc_pidfd_patch_static() {
-    info "Checking Browser Use node_repl glibc pidfd patch scope"
-    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "patch_browser_use_node_repl_glibc_pidfd_symbols"
-    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "is_browser_use_node_repl_ldd_output_compatible"
+test_linux_elf_glibc_pidfd_patch_static() {
+    info "Checking shared Linux ELF glibc pidfd patch scope"
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "patch_linux_elf_glibc_pidfd_symbols"
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "is_linux_elf_ldd_output_compatible"
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "prepare_linux_elf_glibc_compatibility"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "install_browser_use_node_repl_executable_resource"
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" '"Linux Computer Use backend"'
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" '"Linux Computer Use COSMIC helper"'
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" 'prepare_linux_elf_glibc_compatibility "$target_host" "Chrome extension host"'
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "pidfd_spawnp"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "pidfd_getpid"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "GLIBC_2.39"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "GLIBC_2.34"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "non-pidfd GLIBC_2.39 references remain"
-    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" 'ldd "$destination"'
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" 'ldd "$file"'
 }
 
-test_browser_use_node_repl_ldd_output_compatibility() {
-    info "Checking Browser Use node_repl ldd output compatibility gate"
+test_linux_elf_ldd_output_compatibility() {
+    info "Checking shared Linux ELF ldd output compatibility gate"
     # shellcheck disable=SC1091
     source "$REPO_DIR/scripts/lib/bundled-plugins.sh"
 
-    if is_browser_use_node_repl_ldd_output_compatible "/node_repl: /lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.39' not found (required by /node_repl)"; then
+    if is_linux_elf_ldd_output_compatible "/node_repl: /lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.39' not found (required by /node_repl)"; then
         fail "Expected ldd GLIBC version errors to be rejected"
     fi
 
-    if is_browser_use_node_repl_ldd_output_compatible "libmissing.so => not found"; then
+    if is_linux_elf_ldd_output_compatible "libmissing.so => not found"; then
         fail "Expected unresolved ldd libraries to be rejected"
     fi
 
-    is_browser_use_node_repl_ldd_output_compatible "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6" \
+    is_linux_elf_ldd_output_compatible "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6" \
         || fail "Expected ordinary ldd output to be accepted"
+}
+
+test_chrome_extension_host_glibc_compatibility_gate() {
+    info "Checking Chrome extension host glibc compatibility gate"
+    local workspace="$TMP_DIR/chrome-extension-host-glibc"
+    local fake_bin="$workspace/bin"
+    local prebuilt_host="$workspace/codex-chrome-extension-host"
+    local target_plugin="$workspace/plugins/chrome"
+    local target_host="$target_plugin/extension-host/linux/x64/extension-host"
+    local output_log="$workspace/output.log"
+
+    mkdir -p "$fake_bin"
+    cp "$TRUE_BIN" "$prebuilt_host"
+    cat > "$fake_bin/ldd" <<'SH'
+#!/bin/sh
+echo "$1: /lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.39' not found (required by $1)" >&2
+exit 1
+SH
+    chmod +x "$fake_bin/ldd"
+
+    (
+        SCRIPT_DIR="$REPO_DIR"
+        ARCH="x86_64"
+        PATH="$fake_bin:$HOST_TOOL_PATH"
+        warn() { echo "[WARN] $*" >&2; }
+        info() { echo "[INFO] $*" >&2; }
+        # shellcheck disable=SC1091
+        source "$REPO_DIR/scripts/lib/bundled-plugins.sh"
+        build_chrome_extension_host() {
+            printf '%s\n' "$prebuilt_host"
+        }
+        if install_chrome_extension_host_resource "$target_plugin"; then
+            exit 9
+        fi
+    ) >"$output_log" 2>&1
+
+    assert_file_not_exists "$target_host"
+    assert_contains "$output_log" "Chrome extension host is not compatible with this host runtime; skipping"
+}
+
+test_linux_computer_use_glibc_compatibility_gate() {
+    info "Checking Linux Computer Use glibc compatibility gate"
+    local workspace="$TMP_DIR/linux-computer-use-glibc"
+    local fake_bin="$workspace/bin"
+    local prebuilt_backend="$workspace/codex-computer-use-linux"
+    local prebuilt_cosmic="$workspace/codex-computer-use-cosmic"
+    local target_plugins="$workspace/plugins"
+    local target_plugin="$target_plugins/computer-use"
+    local output_log="$workspace/output.log"
+
+    mkdir -p "$fake_bin"
+    cp "$TRUE_BIN" "$prebuilt_backend"
+    cp "$TRUE_BIN" "$prebuilt_cosmic"
+    cat > "$fake_bin/ldd" <<'SH'
+#!/bin/sh
+echo "$1: /lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.39' not found (required by $1)" >&2
+exit 1
+SH
+    chmod +x "$fake_bin/ldd"
+
+    (
+        SCRIPT_DIR="$REPO_DIR"
+        ARCH="x86_64"
+        ICON_SOURCE="$REPO_DIR/assets/codex.png"
+        PATH="$fake_bin:$HOST_TOOL_PATH"
+        warn() { echo "[WARN] $*" >&2; }
+        info() { echo "[INFO] $*" >&2; }
+        # shellcheck disable=SC1091
+        source "$REPO_DIR/scripts/lib/bundled-plugins.sh"
+        build_linux_computer_use_backend() {
+            printf '%s\n%s\n' "$prebuilt_backend" "$prebuilt_cosmic"
+        }
+        if stage_linux_computer_use_plugin "$target_plugins"; then
+            exit 9
+        fi
+    ) >"$output_log" 2>&1
+
+    [ ! -e "$target_plugin" ] || fail "Expected incompatible Computer Use plugin staging to be removed"
+    assert_contains "$output_log" "Linux Computer Use backend is not compatible with this host runtime; skipping"
 }
 
 make_fake_chrome_upstream_app() {
@@ -9425,8 +9508,10 @@ main() {
     test_portable_bundled_plugin_validator_guards
     test_portable_bundled_plugin_stage_failures
     test_portable_bundled_plugin_marketplace_path_guard
-    test_browser_use_node_repl_glibc_pidfd_patch_static
-    test_browser_use_node_repl_ldd_output_compatibility
+    test_linux_elf_glibc_pidfd_patch_static
+    test_linux_elf_ldd_output_compatibility
+    test_chrome_extension_host_glibc_compatibility_gate
+    test_linux_computer_use_glibc_compatibility_gate
     test_chrome_plugin_staging
     test_chrome_marketplace_fallback_synthesis
     test_chrome_native_host_manifest_writer

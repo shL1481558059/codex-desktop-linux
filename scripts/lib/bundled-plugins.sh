@@ -369,9 +369,23 @@ stage_linux_computer_use_plugin() {
     cp "$cosmic_helper_binary" "$target_plugin/bin/codex-computer-use-cosmic"
     chmod 0755 "$target_plugin/bin/codex-computer-use-linux"
     chmod 0755 "$target_plugin/bin/codex-computer-use-cosmic"
+
+    if ! prepare_linux_elf_glibc_compatibility \
+        "$target_plugin/bin/codex-computer-use-linux" \
+        "Linux Computer Use backend"; then
+        rm -rf "$target_plugin"
+        return 1
+    fi
+    if ! prepare_linux_elf_glibc_compatibility \
+        "$target_plugin/bin/codex-computer-use-cosmic" \
+        "Linux Computer Use COSMIC helper"; then
+        rm -rf "$target_plugin"
+        return 1
+    fi
+
     if [ "${backend_binary##*/}" = "computer-use-linux" ]; then
         # The published backend resolves its COSMIC helper by this sibling name.
-        cp "$cosmic_helper_binary" "$target_plugin/bin/computer-use-linux-cosmic"
+        cp "$target_plugin/bin/codex-computer-use-cosmic" "$target_plugin/bin/computer-use-linux-cosmic"
         chmod 0755 "$target_plugin/bin/computer-use-linux-cosmic"
     fi
 
@@ -387,7 +401,8 @@ stage_linux_computer_use_plugin() {
 
 is_host_linux_elf_executable() {
     local file="$1"
-    python3 - "$file" "$ARCH" <<'PY'
+    local host_arch="${ARCH:-$(uname -m)}"
+    python3 - "$file" "$host_arch" <<'PY'
 import pathlib
 import sys
 
@@ -447,16 +462,16 @@ install_linux_executable_resource() {
     install -m 0755 "$source" "$destination"
 }
 
-patch_browser_use_node_repl_glibc_pidfd_symbols() {
+patch_linux_elf_glibc_pidfd_symbols() {
     local file="$1"
     python3 - "$file" <<'PY'
 import pathlib
 import struct
 import sys
 
-# node_repl only needs these pidfd symbols opportunistically. Keeping their
-# GLIBC_2.39 version binding makes the whole binary fail to load on glibc
-# 2.34-2.38.
+# Rust and Node runtimes only need these pidfd symbols opportunistically.
+# Keeping their GLIBC_2.39 version binding makes the whole binary fail to load
+# on glibc 2.34-2.38 even though the weak-symbol fallback remains usable.
 
 path = pathlib.Path(sys.argv[1])
 data = bytearray(path.read_bytes())
@@ -493,7 +508,7 @@ if data[4] != 2 or data[5] != 1:
     sys.exit(0)
 
 e_machine = struct.unpack_from("<H", data, 18)[0]
-if e_machine != 62:
+if e_machine not in {62, 183}:
     sys.exit(0)
 
 e_shoff = struct.unpack_from("<Q", data, 40)[0]
@@ -619,9 +634,49 @@ print("patched")
 PY
 }
 
-is_browser_use_node_repl_ldd_output_compatible() {
+is_linux_elf_ldd_output_compatible() {
     local output="$1"
     ! printf '%s\n' "$output" | grep -Eq "=> not found|version .* not found"
+}
+
+prepare_linux_elf_glibc_compatibility() {
+    local file="$1"
+    local label="$2"
+    local log_level="${3:-warn}"
+    local ldd_output
+    local patch_status
+
+    # Prebuilt overrides may intentionally be wrapper scripts. Only inspect
+    # native ELF payloads that match the build host architecture.
+    if ! is_host_linux_elf_executable "$file"; then
+        return 0
+    fi
+
+    if ! patch_status="$(patch_linux_elf_glibc_pidfd_symbols "$file" 2>&1)"; then
+        if [ "$log_level" = "info" ]; then
+            info "$label has unsupported GLIBC_2.39 runtime references; skipping"
+        else
+            warn "$label has unsupported GLIBC_2.39 runtime references; skipping"
+        fi
+        [ -z "$patch_status" ] || warn "$patch_status"
+        return 1
+    fi
+
+    if [ "$patch_status" = "patched" ]; then
+        info "Patched $label for glibc 2.34+ compatibility"
+    fi
+
+    if command -v ldd >/dev/null 2>&1; then
+        if ! ldd_output="$(ldd "$file" 2>&1)" \
+            || ! is_linux_elf_ldd_output_compatible "$ldd_output"; then
+            if [ "$log_level" = "info" ]; then
+                info "$label is not compatible with this host runtime; skipping"
+            else
+                warn "$label is not compatible with this host runtime; skipping"
+            fi
+            return 1
+        fi
+    fi
 }
 
 install_browser_use_node_repl_executable_resource() {
@@ -629,35 +684,13 @@ install_browser_use_node_repl_executable_resource() {
     local destination="$2"
     local label="$3"
     local log_level="${4:-warn}"
-    local ldd_output
-    local patch_status
-
     if ! install_linux_executable_resource "$source" "$destination" "$label" "$log_level"; then
         return 1
     fi
 
-    if ! patch_status="$(patch_browser_use_node_repl_glibc_pidfd_symbols "$destination" 2>&1)"; then
-        warn "Browser Use $label has unsupported GLIBC_2.39 runtime references; skipping"
-        [ -z "$patch_status" ] || warn "$patch_status"
+    if ! prepare_linux_elf_glibc_compatibility "$destination" "Browser Use $label" "$log_level"; then
         rm -f "$destination"
         return 1
-    fi
-
-    if [ "$patch_status" = "patched" ]; then
-        info "Patched Browser Use $label for glibc 2.34+ compatibility"
-    fi
-
-    if command -v ldd >/dev/null 2>&1; then
-        if ! ldd_output="$(ldd "$destination" 2>&1)" \
-            || ! is_browser_use_node_repl_ldd_output_compatible "$ldd_output"; then
-            if [ "$log_level" = "info" ]; then
-                info "Browser Use $label is not compatible with this host runtime; skipping"
-            else
-                warn "Browser Use $label is not compatible with this host runtime; skipping"
-            fi
-            rm -f "$destination"
-            return 1
-        fi
     fi
 }
 
@@ -827,6 +860,11 @@ install_chrome_extension_host_resource() {
     target_host="$target_plugin/extension-host/linux/$extension_arch/extension-host"
     mkdir -p "$(dirname "$target_host")"
     install -m 0755 "$source_host" "$target_host"
+
+    if ! prepare_linux_elf_glibc_compatibility "$target_host" "Chrome extension host"; then
+        rm -f "$target_host"
+        return 1
+    fi
 }
 
 patch_chrome_plugin_for_linux() {

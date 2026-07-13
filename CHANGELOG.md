@@ -35,6 +35,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The consolidated GitHub Actions package workflow now runs shell, Rust
+  formatting, and script smoke checks before downloading and packaging the
+  upstream DMG, replacing stale smoke assertions for the removed CI workflow.
+- The self-build GitHub Actions workflow now opts into the Linux Computer Use
+  UI while generating the app, so its platform availability and installation
+  flow patches are included in the packaged webview.
+- Chrome's Linux native-messaging host and the Linux Computer Use backend now
+  remove optional `GLIBC_2.39` bindings for `pidfd_getpid` and `pidfd_spawnp`,
+  matching the existing Browser runtime compatibility handling so packages
+  built on Ubuntu 24.04 start on glibc 2.34-2.38 distributions.
 - Approval notifications now preserve the upstream Approve, Approve for
   session, and Decline actions on Linux. A small freedesktop notification
   bridge forwards the action and close signals that Electron's Linux
