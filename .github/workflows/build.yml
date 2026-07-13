@@ -1,0 +1,110 @@
+name: Build Codex Desktop Linux
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install apt packages
+      run: |
+        sudo apt update
+
+        sudo apt install -y \
+          build-essential \
+          git \
+          curl \
+          wget \
+          jq \
+          unzip \
+          zip \
+          p7zip-full \
+          fuse3 \
+          libfuse2 \
+          dpkg-dev \
+          fakeroot \
+          rpm
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: latest
+
+    - name: Install project dependencies
+      run: |
+        bash scripts/install-deps.sh
+
+    - name: Build
+      run: |
+        export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+
+        make package
+
+    - name: List output
+      run: |
+        find dist -type f
+        find dist-next -type f || true
+
+    - name: Upload deb
+      uses: actions/upload-artifact@v4
+      with:
+        name: codex-deb
+        path: |
+          dist/**/*.deb
+          dist/*.deb
+          dist-next/**/*.deb
+
+    - name: Upload rpm
+      uses: actions/upload-artifact@v4
+      with:
+        name: codex-rpm
+        path: |
+          dist/**/*.rpm
+          dist/*.rpm
+          dist-next/**/*.rpm
+
+    - name: Upload AppImage
+      uses: actions/upload-artifact@v4
+      with:
+        name: codex-appimage
+        path: |
+          dist/**/*.AppImage
+          dist/*.AppImage
+          dist-next/**/*.AppImage
+
+    - name: Upload Logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: logs
+        path: |
+          dist-next/rebuild/**
