@@ -6,12 +6,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     os::unix::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         process::CommandExt,
     },
@@ -40,6 +42,9 @@ const MANIFEST_SCHEMA_VERSION: u32 = 2;
 const NATIVE_HOST_PROTOCOL_VERSION: u32 = 2;
 const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const LOGIN_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_LOGIN_SHELL_ENV_BYTES: usize = 1024 * 1024;
+const LOGIN_SHELL_ENV_MARKER: &[u8] = b"\0CODEX_LOGIN_ENV\0";
 const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_APP_SERVER_PROCESSES: usize = 16;
 const MAX_PENDING_HANDSHAKES: usize = 32;
@@ -1445,6 +1450,105 @@ fn bind_proxy_listener(requested: SocketAddr) -> RuntimeResult<TcpListener> {
     }
 }
 
+fn login_shell_environment(
+    shell_override: Option<&Path>,
+) -> io::Result<HashMap<OsString, OsString>> {
+    let shell = shell_override
+        .map(Path::to_path_buf)
+        .or_else(|| env::var_os("SHELL").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let metadata = fs::metadata(&shell)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "login shell is not executable",
+        ));
+    }
+
+    let mut command = Command::new(&shell);
+    command
+        .arg("-lic")
+        .arg("printf '\\000CODEX_LOGIN_ENV\\000'; env -0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("login shell stdout is unavailable"))?;
+    let reader = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut retained = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = stdout.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            if retained.len() < MAX_LOGIN_SHELL_ENV_BYTES {
+                let keep = read.min(MAX_LOGIN_SHELL_ENV_BYTES - retained.len());
+                retained.extend_from_slice(&chunk[..keep]);
+            }
+        }
+        Ok(retained)
+    });
+
+    let deadline = Instant::now() + LOGIN_SHELL_ENV_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = signal_process_group(child.id() as libc::pid_t, libc::SIGKILL);
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "login shell environment timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    // Login profiles occasionally launch background helpers that inherit stdout.
+    // Stop anything left in this dedicated process group before joining the reader.
+    let _ = signal_process_group(child.id() as libc::pid_t, libc::SIGKILL);
+    let output = reader
+        .join()
+        .map_err(|_| io::Error::other("login shell environment reader panicked"))??;
+    if !status.success() {
+        return Err(io::Error::other("login shell environment command failed"));
+    }
+    let marker = output
+        .windows(LOGIN_SHELL_ENV_MARKER.len())
+        .position(|window| window == LOGIN_SHELL_ENV_MARKER)
+        .ok_or_else(|| io::Error::other("login shell environment marker is missing"))?;
+    let mut result = HashMap::new();
+    for entry in output[marker + LOGIN_SHELL_ENV_MARKER.len()..]
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        if separator == 0 {
+            continue;
+        }
+        result.insert(
+            OsString::from_vec(entry[..separator].to_vec()),
+            OsString::from_vec(entry[separator + 1..].to_vec()),
+        );
+    }
+    Ok(result)
+}
+
 fn start_app_server(
     entry: &RuntimeEntry,
     extension_id: &str,
@@ -1453,6 +1557,29 @@ fn start_app_server(
     runtime_root: &Path,
     instance_id: u64,
     unconnected_timeout: Duration,
+) -> RuntimeResult<ManagedProcess> {
+    start_app_server_with_login_shell(
+        entry,
+        extension_id,
+        client_id,
+        proxy_port,
+        runtime_root,
+        instance_id,
+        unconnected_timeout,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_app_server_with_login_shell(
+    entry: &RuntimeEntry,
+    extension_id: &str,
+    client_id: &str,
+    proxy_port: u16,
+    runtime_root: &Path,
+    instance_id: u64,
+    unconnected_timeout: Duration,
+    login_shell_override: Option<&Path>,
 ) -> RuntimeResult<ManagedProcess> {
     prepare_private_dir(runtime_root).map_err(|error| {
         RuntimeError::internal(format!(
@@ -1477,6 +1604,16 @@ fn start_app_server(
     }
 
     let mut command = Command::new(&entry.paths.codex_cli_path);
+    match login_shell_environment(login_shell_override) {
+        Ok(environment) => {
+            command.envs(environment);
+        }
+        Err(error) => {
+            runtime_log(&format!(
+                "failed to load login-shell environment for app-server: {error}"
+            ));
+        }
+    }
     command
         .arg("-c")
         .arg("features.code_mode_host=true")
@@ -1496,9 +1633,13 @@ fn start_app_server(
         .stderr(Stdio::piped());
     if let Some(path) = &entry.paths.browser_client_path {
         command.env("CODEX_BROWSER_CLIENT_PATH", path);
+    } else {
+        command.env_remove("CODEX_BROWSER_CLIENT_PATH");
     }
     if let Some(path) = &entry.paths.node_repl_path {
         command.env("CODEX_NODE_REPL_PATH", path);
+    } else {
+        command.env_remove("CODEX_NODE_REPL_PATH");
     }
     let parent_pid = unsafe { libc::getpid() };
     unsafe {
@@ -3245,6 +3386,22 @@ while True:
         path
     }
 
+    fn fake_login_shell(root: &Path) -> PathBuf {
+        let path = root.join("fake-login-shell");
+        let shell = test_executable("sh");
+        fs::write(
+            &path,
+            format!(
+                "#!{}\nexport OPENAI_API_KEY=login-shell-test-key\nexec {} \"$@\"\n",
+                shell.display(),
+                shell.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
     #[test]
     fn app_server_launch_enables_code_mode_host() {
         let root = test_root("app-server-code-mode-host");
@@ -3276,6 +3433,37 @@ while True:
                 .any(|window| window == ["-c", "features.code_mode_host=true", "app-server"]),
             "app-server command line: {args:?}"
         );
+
+        stop_managed_process(&mut process);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn app_server_launch_imports_login_shell_environment() {
+        let root = test_root("app-server-login-shell-env");
+        fs::create_dir_all(&root).unwrap();
+        let fake_cli = fake_socket_app_server(&root);
+        let login_shell = fake_login_shell(&root);
+        let mut entry = test_entry();
+        entry.paths.codex_cli_path = fake_cli;
+        entry.paths.codex_home = root.clone();
+        let runtime_root = root.join("runtime");
+
+        let mut process = start_app_server_with_login_shell(
+            &entry,
+            "abcdefghijklmnopabcdefghijklmnop",
+            "sidepanel-login-shell-env",
+            41000,
+            &runtime_root,
+            1,
+            Duration::from_secs(1),
+            Some(&login_shell),
+        )
+        .unwrap();
+        let environment = fs::read(format!("/proc/{}/environ", process.child.id())).unwrap();
+        assert!(environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"OPENAI_API_KEY=login-shell-test-key"));
 
         stop_managed_process(&mut process);
         fs::remove_dir_all(root).unwrap();
