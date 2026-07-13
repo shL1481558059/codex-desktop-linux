@@ -14,6 +14,11 @@ It supports:
 
 ## Runtime Dependencies
 
+Debian packages declare `at-spi2-core` as a required dependency. Apt installs
+the AT-SPI D-Bus activation service (`org.a11y.Bus`) automatically with Codex.
+Other package formats or manual installations must provide the equivalent
+AT-SPI core package when element-aware accessibility trees are required.
+
 Install `ydotool` when you need the fallback input path:
 
 ```bash
