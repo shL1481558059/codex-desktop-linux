@@ -2011,11 +2011,20 @@ fn prepare_private_dir(path: &Path) -> io::Result<()> {
 }
 
 fn has_unsafe_write_permissions(metadata: &fs::Metadata) -> bool {
-    let mode = metadata.permissions().mode();
+    unsafe_write_permissions(
+        metadata.permissions().mode(),
+        metadata.uid(),
+        metadata.gid(),
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+    )
+}
+
+fn unsafe_write_permissions(mode: u32, uid: u32, gid: u32, euid: u32, egid: u32) -> bool {
     if mode & 0o002 != 0 {
         return true;
     }
-    mode & 0o020 != 0
+    mode & 0o020 != 0 && (uid != euid || gid != egid)
 }
 
 fn unique_runtime_root() -> PathBuf {
@@ -2867,15 +2876,19 @@ mod tests {
     }
 
     #[test]
-    fn runtime_paths_reject_group_or_world_writable_entries() {
+    fn runtime_paths_allow_the_users_primary_group_but_reject_other_writers() {
         let root = test_root("path-permissions");
         fs::create_dir_all(&root).unwrap();
         let path = root.join("binary");
         fs::write(&path, "binary").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(has_unsafe_write_permissions(&fs::metadata(&path).unwrap()));
+        assert!(!has_unsafe_write_permissions(&fs::metadata(&path).unwrap()));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(has_unsafe_write_permissions(&fs::metadata(&path).unwrap()));
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+        assert!(unsafe_write_permissions(0o770, euid, egid + 1, euid, egid));
+        assert!(unsafe_write_permissions(0o770, euid + 1, egid, euid, egid));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2922,18 +2935,18 @@ mod tests {
     }
 
     #[test]
-    fn executable_validation_rejects_a_group_writable_parent() {
+    fn executable_validation_accepts_a_primary_group_writable_user_tree() {
         let root = test_root("group-writable-parent");
-        let unsafe_parent = root.join("shared");
-        fs::create_dir_all(&unsafe_parent).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o770)).unwrap();
-        let executable = unsafe_parent.join("codex");
+        let group_writable_parent = root.join("shared");
+        fs::create_dir_all(&group_writable_parent).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::set_permissions(&group_writable_parent, fs::Permissions::from_mode(0o770)).unwrap();
+        let executable = group_writable_parent.join("codex");
         fs::write(&executable, "binary").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o770)).unwrap();
 
-        assert!(validate_owned_file(&executable, true).is_err());
-        assert!(validate_owned_dir(&unsafe_parent, true).is_err());
+        assert!(validate_owned_file(&executable, true).is_ok());
+        assert!(validate_owned_dir(&group_writable_parent, true).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 
