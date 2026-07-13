@@ -244,13 +244,13 @@ pub fn prepare_screenshot_payload(
     if raw.bytes.is_empty() {
         bail!("screenshot file was empty");
     }
-    let (coordinate_width, coordinate_height) = png_dimensions(&raw.bytes)?;
+    let (coordinate_width, coordinate_height) = image_dimensions(&raw.bytes)?;
     let original_bytes = raw.bytes.len();
     let options = options.resolve();
     let (target_width, target_height) =
         target_dimensions(coordinate_width, coordinate_height, options);
 
-    let (bytes, width, height) = if options.format == ScreenshotOutputFormat::Png
+    let (bytes, width, height) = if raw.mime_type == options.format.mime_type()
         && target_width == coordinate_width
         && target_height == coordinate_height
         && original_bytes <= options.max_bytes
@@ -322,7 +322,7 @@ async fn capture_with_gnome_shell() -> Result<RawScreenshotCapture> {
         bail!("GNOME Shell reported screenshot failure");
     }
 
-    read_png_as_capture(
+    read_image_as_capture(
         PathBuf::from(filename_used),
         "gnome-shell",
         ScreenshotCleanup::DeletePath(path),
@@ -358,7 +358,7 @@ async fn capture_with_gnome_extension() -> Result<RawScreenshotCapture> {
         bail!("Codex GNOME Shell extension refused screenshot: {message}");
     }
 
-    read_png_as_capture(
+    read_image_as_capture(
         path.clone(),
         "gnome-shell-extension",
         ScreenshotCleanup::DeletePath(path),
@@ -412,7 +412,7 @@ async fn capture_with_portal() -> Result<RawScreenshotCapture> {
         .context("XDG portal screenshot uri was not a string")?;
     let path = file_uri_to_path(&uri)?;
 
-    read_png_as_capture(path, "xdg-desktop-portal", ScreenshotCleanup::Preserve).await
+    read_image_as_capture(path, "xdg-desktop-portal", ScreenshotCleanup::Preserve).await
 }
 
 /// Upper bound on how long we wait for `gnome-screenshot` before killing it.
@@ -462,7 +462,7 @@ async fn capture_with_gnome_screenshot() -> Result<RawScreenshotCapture> {
         bail!("gnome-screenshot exited with {status}");
     }
 
-    read_png_as_capture(
+    read_image_as_capture(
         path.clone(),
         "gnome-screenshot",
         ScreenshotCleanup::DeletePath(path),
@@ -512,27 +512,27 @@ fn portal_response_matches_path(response: &Message, request_path: &str) -> bool 
         .is_some_and(|path| path.as_str() == request_path)
 }
 
-async fn read_png_as_capture(
+async fn read_image_as_capture(
     path: PathBuf,
     source: &str,
     cleanup: ScreenshotCleanup,
 ) -> Result<RawScreenshotCapture> {
-    let result = read_png_as_capture_inner(&path, source);
+    let result = read_image_as_capture_inner(&path, source);
     if let ScreenshotCleanup::DeletePath(path) = cleanup {
         let _ = fs::remove_file(path);
     }
     result
 }
 
-fn read_png_as_capture_inner(path: &Path, source: &str) -> Result<RawScreenshotCapture> {
+fn read_image_as_capture_inner(path: &Path, source: &str) -> Result<RawScreenshotCapture> {
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read screenshot file {}", path.display()))?;
     if bytes.is_empty() {
         bail!("screenshot file was empty: {}", path.display());
     }
-    let (width, height) = png_dimensions(&bytes)?;
+    let (format, width, height) = image_metadata(&bytes)?;
     Ok(RawScreenshotCapture {
-        mime_type: "image/png".to_string(),
+        mime_type: image_format_mime_type(format).to_string(),
         bytes,
         source: source.to_string(),
         width,
@@ -565,11 +565,16 @@ fn encode_screenshot_to_fit_bytes(
     mut target_height: u32,
     options: ResolvedScreenshotPayloadOptions,
 ) -> Result<(Vec<u8>, u32, u32)> {
-    let img = image::load_from_memory_with_format(raw, image::ImageFormat::Png)
-        .context("failed to decode screenshot PNG for encoding")?;
+    let input_format = supported_image_format(raw)?;
+    let output_format = match options.format {
+        ScreenshotOutputFormat::Png => image::ImageFormat::Png,
+        ScreenshotOutputFormat::Jpeg => image::ImageFormat::Jpeg,
+    };
+    let img =
+        image::load_from_memory(raw).context("failed to decode screenshot image for encoding")?;
 
     loop {
-        let bytes = if options.format == ScreenshotOutputFormat::Png
+        let bytes = if input_format == output_format
             && target_width == original_width
             && target_height == original_height
         {
@@ -648,6 +653,39 @@ fn cleanup_gnome_requested_path(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+fn supported_image_format(bytes: &[u8]) -> Result<image::ImageFormat> {
+    let format = image::guess_format(bytes).context("screenshot file format was not recognized")?;
+    match format {
+        image::ImageFormat::Png | image::ImageFormat::Jpeg => Ok(format),
+        _ => bail!("screenshot file used unsupported image format {format:?}"),
+    }
+}
+
+fn image_format_mime_type(format: image::ImageFormat) -> &'static str {
+    match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        _ => unreachable!("unsupported screenshot image format"),
+    }
+}
+
+fn image_metadata(bytes: &[u8]) -> Result<(image::ImageFormat, u32, u32)> {
+    let format = supported_image_format(bytes)?;
+    let decoded = image::load_from_memory_with_format(bytes, format)
+        .context("failed to decode screenshot image")?;
+    let (width, height) = (decoded.width(), decoded.height());
+    if width == 0 || height == 0 {
+        bail!("screenshot image had invalid dimensions {width}x{height}");
+    }
+    Ok((format, width, height))
+}
+
+fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+    let (_, width, height) = image_metadata(bytes)?;
+    Ok((width, height))
+}
+
+#[cfg(test)]
 fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     if bytes.len() < 24 || &bytes[..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
@@ -737,6 +775,15 @@ mod tests {
         encode_test_png(img)
     }
 
+    fn solid_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(width, height, image::Rgb([24, 96, 160]));
+        let mut out = Vec::new();
+        JpegEncoder::new_with_quality(&mut out, 85)
+            .encode_image(&img)
+            .unwrap();
+        out
+    }
+
     fn noisy_png(width: u32, height: u32) -> Vec<u8> {
         let mut img = image::RgbaImage::new(width, height);
         for (x, y, pixel) in img.enumerate_pixels_mut() {
@@ -757,9 +804,13 @@ mod tests {
     }
 
     fn raw_capture(bytes: Vec<u8>) -> RawScreenshotCapture {
-        let (width, height) = png_dimensions(&bytes).unwrap();
+        raw_capture_with_mime(bytes, "image/png")
+    }
+
+    fn raw_capture_with_mime(bytes: Vec<u8>, mime_type: &str) -> RawScreenshotCapture {
+        let (width, height) = image_dimensions(&bytes).unwrap();
         RawScreenshotCapture {
-            mime_type: "image/png".to_string(),
+            mime_type: mime_type.to_string(),
             bytes,
             source: "test".to_string(),
             width,
@@ -916,12 +967,34 @@ mod tests {
         assert!(capture.data_url.starts_with("data:image/jpeg;base64,"));
     }
 
+    #[test]
+    fn default_payload_transcodes_jpeg_to_png() {
+        let capture = prepare_screenshot_payload(
+            raw_capture_with_mime(solid_jpeg(64, 32), "image/jpeg"),
+            ScreenshotPayloadOptions {
+                max_width: Some(64),
+                max_height: Some(32),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(capture.mime_type, "image/png");
+        assert_eq!((capture.width, capture.height), (64, 32));
+        let encoded = capture.data_url.split_once(',').unwrap().1;
+        let bytes = STANDARD.decode(encoded).unwrap();
+        assert_eq!(
+            image::guess_format(&bytes).unwrap(),
+            image::ImageFormat::Png
+        );
+    }
+
     #[tokio::test]
     async fn portal_capture_preserves_valid_returned_path() {
         let path = test_path("portal-valid");
-        fs::write(&path, valid_png(1, 1)).unwrap();
+        fs::write(&path, solid_png(1, 1)).unwrap();
 
-        let capture = read_png_as_capture(
+        let capture = read_image_as_capture(
             path.clone(),
             "xdg-desktop-portal",
             ScreenshotCleanup::Preserve,
@@ -935,11 +1008,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portal_capture_accepts_jpeg_and_preserves_returned_path() {
+        let path = test_path("portal-jpeg");
+        let jpeg = solid_jpeg(320, 180);
+        fs::write(&path, &jpeg).unwrap();
+
+        let capture = read_image_as_capture(
+            path.clone(),
+            "xdg-desktop-portal",
+            ScreenshotCleanup::Preserve,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(capture.mime_type, "image/jpeg");
+        assert_eq!((capture.width, capture.height), (320, 180));
+        assert_eq!(capture.bytes, jpeg);
+        assert!(path.exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn portal_capture_preserves_invalid_returned_path() {
         let path = test_path("portal-invalid");
         fs::write(&path, b"").unwrap();
 
-        let error = read_png_as_capture(
+        let error = read_image_as_capture(
             path.clone(),
             "xdg-desktop-portal",
             ScreenshotCleanup::Preserve,
@@ -955,9 +1049,9 @@ mod tests {
     #[tokio::test]
     async fn gnome_capture_deletes_backend_temp_path_on_success() {
         let path = test_path("gnome-valid");
-        fs::write(&path, valid_png(1, 1)).unwrap();
+        fs::write(&path, solid_png(1, 1)).unwrap();
 
-        let capture = read_png_as_capture(
+        let capture = read_image_as_capture(
             path.clone(),
             "gnome-shell",
             ScreenshotCleanup::DeletePath(path.clone()),
@@ -974,7 +1068,7 @@ mod tests {
         let path = test_path("gnome-invalid");
         fs::write(&path, b"").unwrap();
 
-        let error = read_png_as_capture(
+        let error = read_image_as_capture(
             path.clone(),
             "gnome-shell",
             ScreenshotCleanup::DeletePath(path.clone()),
@@ -1001,9 +1095,9 @@ mod tests {
         let requested = test_path("gnome-requested");
         let returned = test_path("gnome-returned");
         fs::write(&requested, b"partial").unwrap();
-        fs::write(&returned, valid_png(1, 1)).unwrap();
+        fs::write(&returned, solid_png(1, 1)).unwrap();
 
-        let capture = read_png_as_capture(
+        let capture = read_image_as_capture(
             returned.clone(),
             "gnome-shell",
             ScreenshotCleanup::DeletePath(requested.clone()),
