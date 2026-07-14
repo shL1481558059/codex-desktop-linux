@@ -65,6 +65,31 @@ pub struct ComputerUseLinux {
     /// Cached logical desktop size (union of monitors) from the most recent
     /// full-frame capture; used for off-screen window/coordinate warnings.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
+    /// Mapping from pixels in the most recently returned screenshot payload to
+    /// physical desktop coordinates accepted by pointer input backends.
+    last_screenshot_coordinates: Arc<Mutex<Option<ScreenshotCoordinateMap>>>,
+    /// Mapping from cached AT-SPI logical coordinates to the physical X11
+    /// window geometry used by coordinate input fallbacks.
+    last_atspi_coordinates: Arc<Mutex<Option<AtspiCoordinateMap>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenshotCoordinateMap {
+    image_width: u32,
+    image_height: u32,
+    coordinate_width: u32,
+    coordinate_height: u32,
+    origin_x: i32,
+    origin_y: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AtspiCoordinateMap {
+    logical_x: i32,
+    logical_y: i32,
+    physical_x: i32,
+    physical_y: i32,
+    scale: f64,
 }
 
 #[tool_router]
@@ -256,12 +281,24 @@ impl ComputerUseLinux {
             .resolve_accessibility_app_filter(&params, window_context.as_ref())
             .await;
         let (screenshot, screenshot_error) = if include_screenshot {
-            match capture_screenshot_raw()
-                .await
-                .and_then(|raw| prepare_screenshot_payload(raw, screenshot_options))
-            {
-                Ok(capture) => (Some(capture), None),
-                Err(error) => (None, Some(format!("{error:#}"))),
+            match capture_screenshot_raw().await {
+                Ok(raw) => {
+                    self.cache_desktop_size(raw.width, raw.height);
+                    match prepare_screenshot_payload(raw, screenshot_options) {
+                        Ok(capture) => {
+                            self.cache_screenshot_coordinates(&capture);
+                            (Some(capture), None)
+                        }
+                        Err(error) => {
+                            self.clear_screenshot_coordinates();
+                            (None, Some(format!("{error:#}")))
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.clear_screenshot_coordinates();
+                    (None, Some(format!("{error:#}")))
+                }
             }
         } else {
             (None, None)
@@ -289,7 +326,7 @@ impl ComputerUseLinux {
                 )
         };
         if accessibility_error.is_none() {
-            self.cache_nodes(&accessibility_tree);
+            self.cache_nodes_for_window(&accessibility_tree, window_context.as_ref());
         } else {
             self.clear_cached_nodes();
         }
@@ -418,16 +455,25 @@ impl ComputerUseLinux {
             },
             None => (raw_capture, false),
         };
-        let capture =
-            prepare_screenshot_payload(capture, params.screenshot_options()).map_err(|e| {
+        let mut capture = prepare_screenshot_payload(capture, params.screenshot_options())
+            .map_err(|e| {
                 ErrorData::internal_error(format!("screenshot resize failed: {e}"), None)
             })?;
+        if cropped {
+            if let Some((x, y, _, _)) = crop.as_ref().and_then(window_crop_rect) {
+                capture.coordinate_origin_x = x.max(0);
+                capture.coordinate_origin_y = y.max(0);
+            }
+        }
+        self.cache_screenshot_coordinates(&capture);
 
         let mut caption = serde_json::json!({
             "width": capture.width,
             "height": capture.height,
             "coordinate_width": capture.coordinate_width,
             "coordinate_height": capture.coordinate_height,
+            "coordinate_origin_x": capture.coordinate_origin_x,
+            "coordinate_origin_y": capture.coordinate_origin_y,
             "scale": capture.scale,
             "resized": capture.resized,
             "bytes": capture.bytes,
@@ -438,6 +484,8 @@ impl ComputerUseLinux {
             "source": capture.source,
             "cropped_to_window": cropped,
             "window_title": window_label,
+            "coordinate_space": "screenshot",
+            "coordinate_usage": "Pass x/y from this returned image with coordinate_space=screenshot; the backend will convert resize and crop offsets to desktop pixels.",
         });
         if let Some(note) = off_screen_note {
             caption["window_off_screen"] = serde_json::json!(true);
@@ -514,7 +562,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata.",
+        description = "Click an element by index, semantic selector, or coordinates. For a point chosen from the latest get_app_state/screenshot image, pass coordinate_space=\"screenshot\" so resize and crop offsets are converted automatically; desktop remains the backward-compatible default.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -524,6 +572,28 @@ impl ComputerUseLinux {
     )]
     async fn click(&self, Parameters(mut params): Parameters<ClickParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        if params.coordinate_space == CoordinateSpace::Screenshot && params.relative == Some(true) {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "click".to_string(),
+                message: "coordinate_space=screenshot already includes the screenshot crop origin and cannot be combined with relative=true."
+                    .to_string(),
+                received,
+            });
+        }
+        let coordinate_space = params.coordinate_space;
+        if let Err(message) =
+            self.translate_explicit_point(&mut params.x, &mut params.y, coordinate_space)
+        {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "click".to_string(),
+                message,
+                received,
+            });
+        }
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
         let window_target = params.window_target();
@@ -586,50 +656,68 @@ impl ComputerUseLinux {
                 });
             }
         };
-        if let ClickTarget::PrimaryAction {
-            object_ref,
-            action_name,
-            action_index,
-        } = target
-        {
-            let action_index = action_index.to_string();
-            return match invoke_accessibility_action(&object_ref, Some(&action_index)).await {
-                Ok(invocation) => Json(ActionOutput {
-                    ok: invocation.ok,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: if invocation.ok {
-                        format!(
-                            "No clickable bounds were cached, so I invoked the primary AT-SPI action{}.",
-                            action_name
-                                .as_deref()
-                                .filter(|name| !name.is_empty())
-                                .map(|name| format!(" ({name})"))
-                                .unwrap_or_default()
-                        )
-                    } else {
-                        format!(
-                            "The primary AT-SPI action{} returned false.",
-                            action_name
-                                .as_deref()
-                                .filter(|name| !name.is_empty())
-                                .map(|name| format!(" ({name})"))
-                                .unwrap_or_default()
-                        )
-                    },
-                    received,
-                }),
-                Err(error) => Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: error.to_string(),
-                    received,
-                }),
-            };
-        }
-        let ClickTarget::Coordinates(x, y) = target else {
-            unreachable!("click target must resolve to coordinates or an AT-SPI action");
+        let mut native_action_fallback_note = None;
+        let (x, y) = match target {
+            ClickTarget::Coordinates(x, y) => (x, y),
+            ClickTarget::PrimaryAction {
+                object_ref,
+                action_name,
+                action_index,
+                fallback_coordinates,
+            } => {
+                let action_label = action_name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| format!(" ({name})"))
+                    .unwrap_or_default();
+                let action_index = action_index.to_string();
+                match invoke_accessibility_action(&object_ref, Some(&action_index)).await {
+                    Ok(invocation) if invocation.ok => {
+                        return Json(ActionOutput {
+                            ok: true,
+                            implemented: true,
+                            action: "click".to_string(),
+                            message: format!(
+                                "Invoked the primary AT-SPI action{action_label}; no coordinate conversion was needed."
+                            ),
+                            received,
+                        });
+                    }
+                    Ok(_) => {
+                        let Some(point) = fallback_coordinates else {
+                            return Json(ActionOutput {
+                                ok: false,
+                                implemented: true,
+                                action: "click".to_string(),
+                                message: format!(
+                                    "The primary AT-SPI action{action_label} returned false and no coordinate fallback is available."
+                                ),
+                                received,
+                            });
+                        };
+                        native_action_fallback_note = Some(format!(
+                            "The primary AT-SPI action{action_label} returned false, so the backend used its coordinate fallback."
+                        ));
+                        point
+                    }
+                    Err(error) => {
+                        let Some(point) = fallback_coordinates else {
+                            return Json(ActionOutput {
+                                ok: false,
+                                implemented: true,
+                                action: "click".to_string(),
+                                message: error.to_string(),
+                                received,
+                            });
+                        };
+                        native_action_fallback_note = Some(format!(
+                            "The primary AT-SPI action{action_label} failed ({}), so the backend used its coordinate fallback.",
+                            first_line(&error.to_string())
+                        ));
+                        point
+                    }
+                }
+            }
         };
         let button = mouse_button_code(params.button.as_deref());
         let click_count = params.click_count.unwrap_or(1).clamp(1, 10).to_string();
@@ -641,6 +729,13 @@ impl ComputerUseLinux {
         // Off-screen coordinates "succeed" at the uinput layer while landing on
         // no visible pixel — surface that instead of a silent no-op.
         let off_screen_note = self.off_screen_note_for_point(x, y).await;
+        let mut coordinate_notes = Vec::new();
+        if let Some(note) = native_action_fallback_note {
+            coordinate_notes.push(note);
+        }
+        if let Some(note) = off_screen_note {
+            coordinate_notes.push(note);
+        }
         if self.should_prefer_xdotool_input_backend() {
             let result = run_xdotool(&xdotool_click_args(
                 x,
@@ -652,7 +747,7 @@ impl ComputerUseLinux {
             .map(|output| vec![output]);
             return Json(with_notes(
                 action_result_for_backend("click", result, received, "xdotool"),
-                off_screen_note,
+                coordinate_notes,
             ));
         }
         if self
@@ -673,7 +768,7 @@ impl ComputerUseLinux {
                     message: "Action sent through the uinput absolute pointer.".to_string(),
                     received,
                 },
-                off_screen_note.clone(),
+                coordinate_notes.clone(),
             ));
         }
         if let Some(session) = self.cached_portal_pointer_session() {
@@ -695,7 +790,7 @@ impl ComputerUseLinux {
                             message: "Action sent through the remote desktop portal.".to_string(),
                             received,
                         },
-                        off_screen_note.clone(),
+                        coordinate_notes.clone(),
                     ));
                 }
                 Err(_) => self.clear_portal_pointer_session(),
@@ -721,7 +816,7 @@ impl ComputerUseLinux {
                                     .to_string(),
                                 received,
                             },
-                            off_screen_note.clone(),
+                            coordinate_notes.clone(),
                         ));
                     }
                     Err(_) => self.clear_portal_pointer_session(),
@@ -742,7 +837,7 @@ impl ComputerUseLinux {
         .await;
         Json(with_notes(
             action_result("click", result, received),
-            off_screen_note,
+            coordinate_notes,
         ))
     }
 
@@ -825,7 +920,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "scroll",
-        description = "Scroll an element in a direction by a number of pages. With a window target and no x/y/element_index, scrolls at the centre of the targeted window.",
+        description = "Scroll an element in a direction by a number of pages. For a point chosen from the latest screenshot image, pass coordinate_space=\"screenshot\". With a window target and no x/y/element_index, scrolls at the centre of the targeted window.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -835,6 +930,28 @@ impl ComputerUseLinux {
     )]
     async fn scroll(&self, Parameters(mut params): Parameters<ScrollParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        if params.coordinate_space == CoordinateSpace::Screenshot && params.relative == Some(true) {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "scroll".to_string(),
+                message: "coordinate_space=screenshot already includes the screenshot crop origin and cannot be combined with relative=true."
+                    .to_string(),
+                received,
+            });
+        }
+        let coordinate_space = params.coordinate_space;
+        if let Err(message) =
+            self.translate_explicit_point(&mut params.x, &mut params.y, coordinate_space)
+        {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "scroll".to_string(),
+                message,
+                received,
+            });
+        }
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
         // Raise/focus the target window first (parity with click) so wheel
         // events land on the intended app.
@@ -1027,7 +1144,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "drag",
-        description = "Drag from one point to another using pixel coordinates.",
+        description = "Drag from one point to another. For points chosen from the latest screenshot image, pass coordinate_space=\"screenshot\" so resize and crop offsets are converted automatically.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1035,8 +1152,28 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
-        let received = Some(serde_json::json!(params));
+    async fn drag(&self, Parameters(mut params): Parameters<DragParams>) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        if params.coordinate_space == CoordinateSpace::Screenshot {
+            let start = self.screenshot_point_to_desktop(params.start_x, params.start_y);
+            let end = self.screenshot_point_to_desktop(params.end_x, params.end_y);
+            let ((start_x, start_y), (end_x, end_y)) = match (start, end) {
+                (Ok(start), Ok(end)) => (start, end),
+                (Err(message), _) | (_, Err(message)) => {
+                    return Json(ActionOutput {
+                        ok: false,
+                        implemented: true,
+                        action: "drag".to_string(),
+                        message,
+                        received,
+                    });
+                }
+            };
+            params.start_x = start_x;
+            params.start_y = start_y;
+            params.end_x = end_x;
+            params.end_y = end_y;
+        }
         if self.should_prefer_xdotool_input_backend() {
             let result = run_xdotool(&xdotool_drag_args(
                 params.start_x,
@@ -1390,7 +1527,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.3.1-linux-alpha1",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state with only the needed app/window selectors; keep the first call on the default PNG and omit format/quality. Tool arguments must always be strict JSON. Enum values such as jpeg and png are JSON strings: use {\"format\":\"jpeg\",\"quality\":70}, never a bare value such as {\"format\":jpeg}. If a tool call reports a JSON argument parse error, retry it once with strict JSON instead of ending the task. If diagnostics report disabled accessibility on GNOME, call setup_accessibility before asking the user to retry. If AT-SPI is unavailable on a non-GNOME desktop such as Deepin, do not repeatedly call setup_accessibility; continue with screenshots and coordinate input when readiness confirms an input backend. Use list_windows/focused_window before targeted keyboard input when window introspection is available. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send exact window focus plus pointer/keyboard input through xdotool on X11, send coordinate or element-targeted input through the Wayland remote desktop portal when available, and use ydotool as a fallback. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, a strict JSON format string, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state with only the needed app/window selectors; keep the first call on the default PNG and omit format/quality. Tool arguments must always be strict JSON. Enum values such as jpeg and png are JSON strings: use {\"format\":\"jpeg\",\"quality\":70}, never a bare value such as {\"format\":jpeg}. If a tool call reports a JSON argument parse error, retry it once with strict JSON instead of ending the task. If diagnostics report disabled accessibility on GNOME, call setup_accessibility before asking the user to retry. If AT-SPI is unavailable on a non-GNOME desktop such as Deepin, do not repeatedly call setup_accessibility; continue with screenshots and coordinate input when readiness confirms an input backend. Use list_windows/focused_window before targeted keyboard input when window introspection is available. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send exact window focus plus pointer/keyboard input through xdotool on X11, send coordinate or element-targeted input through the Wayland remote desktop portal when available, and use ydotool as a fallback. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height, coordinate origin, and scale metadata. For every point selected visually from the latest returned image, pass coordinate_space=\"screenshot\" to click, scroll, or drag so resize and crop offsets are converted automatically; desktop is only for already-physical desktop pixels. Call get_app_state or screenshot immediately before using screenshot coordinates because a later image replaces the cached mapping. Request more detail with max_width, max_height, max_bytes, a strict JSON format string, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. Plain left clicks prefer native AT-SPI actions, and scaled X11 coordinate fallbacks are aligned to the physical target window. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -1731,11 +1868,17 @@ struct ClickParams {
     wm_class: Option<String>,
     #[serde(default)]
     window_title: Option<String>,
-    /// Interpret `x`/`y` as relative to the targeted window's top-left corner
-    /// (the same coordinate space as a window-cropped `screenshot`). Requires a
-    /// window target; ignored otherwise.
+    /// Interpret physical desktop `x`/`y` as relative to the targeted window's
+    /// top-left corner. For pixels selected from a resized/cropped screenshot,
+    /// use coordinate_space=screenshot instead. Requires a window target.
     #[serde(default)]
     relative: Option<bool>,
+    /// Coordinate system used by explicit x/y values. `desktop` (default)
+    /// accepts physical desktop pixels. `screenshot` accepts pixels from the
+    /// most recently returned get_app_state/screenshot image and converts them
+    /// using its resize and crop metadata.
+    #[serde(default)]
+    coordinate_space: CoordinateSpace,
 }
 
 impl ClickParams {
@@ -1852,11 +1995,14 @@ struct ScrollParams {
     wm_class: Option<String>,
     #[serde(default)]
     window_title: Option<String>,
-    /// Interpret `x`/`y` as relative to the targeted window's top-left corner
-    /// (the same coordinate space as a window-cropped `screenshot`). Requires a
-    /// window target; ignored otherwise.
+    /// Interpret physical desktop `x`/`y` as relative to the targeted window's
+    /// top-left corner. For pixels selected from a resized/cropped screenshot,
+    /// use coordinate_space=screenshot instead. Requires a window target.
     #[serde(default)]
     relative: Option<bool>,
+    /// Coordinate system used by explicit x/y values. See click.
+    #[serde(default)]
+    coordinate_space: CoordinateSpace,
 }
 
 impl ScrollParams {
@@ -1890,6 +2036,17 @@ struct DragParams {
     start_y: i32,
     end_x: i32,
     end_y: i32,
+    /// Coordinate system used by all four points. See click.
+    #[serde(default)]
+    coordinate_space: CoordinateSpace,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum CoordinateSpace {
+    #[default]
+    Desktop,
+    Screenshot,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -2217,6 +2374,63 @@ impl ComputerUseLinux {
         }
     }
 
+    fn cache_screenshot_coordinates(&self, capture: &ScreenshotCapture) {
+        let mapping = ScreenshotCoordinateMap {
+            image_width: capture.width,
+            image_height: capture.height,
+            coordinate_width: capture.coordinate_width,
+            coordinate_height: capture.coordinate_height,
+            origin_x: capture.coordinate_origin_x,
+            origin_y: capture.coordinate_origin_y,
+        };
+        if let Ok(mut guard) = self.last_screenshot_coordinates.lock() {
+            *guard = Some(mapping);
+        }
+    }
+
+    fn clear_screenshot_coordinates(&self) {
+        if let Ok(mut guard) = self.last_screenshot_coordinates.lock() {
+            *guard = None;
+        }
+    }
+
+    fn screenshot_point_to_desktop(
+        &self,
+        x: i32,
+        y: i32,
+    ) -> std::result::Result<(i32, i32), String> {
+        let mapping = self
+            .last_screenshot_coordinates
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .ok_or_else(|| {
+                "No screenshot coordinate mapping is cached. Call get_app_state or screenshot immediately before using coordinate_space=screenshot."
+                    .to_string()
+            })?;
+        screenshot_point_to_desktop(mapping, x, y)
+    }
+
+    fn translate_explicit_point(
+        &self,
+        x: &mut Option<i32>,
+        y: &mut Option<i32>,
+        coordinate_space: CoordinateSpace,
+    ) -> std::result::Result<(), String> {
+        if coordinate_space == CoordinateSpace::Desktop {
+            return Ok(());
+        }
+        let (point_x, point_y) = match (x.as_ref(), y.as_ref()) {
+            (Some(point_x), Some(point_y)) => (*point_x, *point_y),
+            (None, None) => return Ok(()),
+            _ => return Err("Screenshot coordinate conversion requires both x and y.".to_string()),
+        };
+        let (desktop_x, desktop_y) = self.screenshot_point_to_desktop(point_x, point_y)?;
+        *x = Some(desktop_x);
+        *y = Some(desktop_y);
+        Ok(())
+    }
+
     /// COORDINATE SPACES: window bounds (list_windows / extension frame rects)
     /// and the extension monitor layout are in LOGICAL pixels, while click/
     /// scroll coordinates and screenshot captures are in PHYSICAL capture
@@ -2449,11 +2663,25 @@ impl ComputerUseLinux {
             cached.clear();
             cached.extend_from_slice(nodes);
         }
+        if let Ok(mut mapping) = self.last_atspi_coordinates.lock() {
+            *mapping = None;
+        }
+    }
+
+    fn cache_nodes_for_window(&self, nodes: &[AccessibilityNode], window: Option<&WindowInfo>) {
+        self.cache_nodes(nodes);
+        let coordinate_map = window.and_then(|window| atspi_coordinate_map(nodes, window));
+        if let Ok(mut mapping) = self.last_atspi_coordinates.lock() {
+            *mapping = coordinate_map;
+        }
     }
 
     fn clear_cached_nodes(&self) {
         if let Ok(mut cached) = self.last_nodes.lock() {
             cached.clear();
+        }
+        if let Ok(mut mapping) = self.last_atspi_coordinates.lock() {
+            *mapping = None;
         }
     }
 
@@ -2492,7 +2720,23 @@ impl ComputerUseLinux {
             ElementResolvePurpose::Click,
         )?;
 
-        if let Some((x, y)) = node.bounds.as_ref().and_then(bounds_center) {
+        let fallback_coordinates = node
+            .bounds
+            .as_ref()
+            .and_then(bounds_center)
+            .map(|point| self.atspi_point_to_desktop(point));
+        if is_plain_left_click(params.button.as_deref(), params.click_count) {
+            if let Some(action) = primary_action(node.actions.as_slice()) {
+                return Ok(ClickTarget::PrimaryAction {
+                    object_ref: node.object_ref.clone(),
+                    action_name: Some(action.name.clone()),
+                    action_index: action.index,
+                    fallback_coordinates,
+                });
+            }
+        }
+
+        if let Some((x, y)) = fallback_coordinates {
             return Ok(ClickTarget::Coordinates(x, y));
         }
 
@@ -2503,23 +2747,27 @@ impl ComputerUseLinux {
             ));
         }
 
-        let Some(action) = primary_action(node.actions.as_slice()) else {
-            return Err(format!(
-                "No clickable bounds cached for element_index {}, and the element exposes no primary AT-SPI action.",
-                node.index
-            ));
-        };
-        Ok(ClickTarget::PrimaryAction {
-            object_ref: node.object_ref.clone(),
-            action_name: Some(action.name.clone()),
-            action_index: action.index,
-        })
+        Err(format!(
+            "No clickable bounds cached for element_index {}, and the element exposes no primary AT-SPI action.",
+            node.index
+        ))
     }
 
     fn center_for_cached_node(&self, element_index: u32) -> Option<(i32, i32)> {
         let cached = self.last_nodes.lock().ok()?;
         let node = cached.iter().find(|node| node.index == element_index)?;
-        bounds_center(node.bounds.as_ref()?)
+        bounds_center(node.bounds.as_ref()?).map(|point| self.atspi_point_to_desktop(point))
+    }
+
+    fn atspi_point_to_desktop(&self, point: (i32, i32)) -> (i32, i32) {
+        let mapping = self
+            .last_atspi_coordinates
+            .lock()
+            .ok()
+            .and_then(|mapping| *mapping);
+        mapping
+            .and_then(|mapping| map_atspi_point(mapping, point))
+            .unwrap_or(point)
     }
 
     fn resolve_object_ref(
@@ -2642,6 +2890,7 @@ enum ClickTarget {
         object_ref: String,
         action_name: Option<String>,
         action_index: i32,
+        fallback_coordinates: Option<(i32, i32)>,
     },
 }
 
@@ -2875,6 +3124,128 @@ fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
         bounds.x.checked_add(bounds.width / 2)?,
         bounds.y.checked_add(bounds.height / 2)?,
     ))
+}
+
+fn screenshot_point_to_desktop(
+    mapping: ScreenshotCoordinateMap,
+    x: i32,
+    y: i32,
+) -> std::result::Result<(i32, i32), String> {
+    if mapping.image_width == 0
+        || mapping.image_height == 0
+        || mapping.coordinate_width == 0
+        || mapping.coordinate_height == 0
+    {
+        return Err("The cached screenshot has invalid coordinate metadata.".to_string());
+    }
+    if x < 0 || y < 0 || x as u32 >= mapping.image_width || y as u32 >= mapping.image_height {
+        return Err(format!(
+            "Screenshot coordinate {x},{y} is outside the most recently returned image ({}x{}).",
+            mapping.image_width, mapping.image_height
+        ));
+    }
+
+    let scaled_x = ((x as i64 * mapping.coordinate_width as i64)
+        + i64::from(mapping.image_width / 2))
+        / i64::from(mapping.image_width);
+    let scaled_y = ((y as i64 * mapping.coordinate_height as i64)
+        + i64::from(mapping.image_height / 2))
+        / i64::from(mapping.image_height);
+    let desktop_x = i64::from(mapping.origin_x)
+        .checked_add(scaled_x)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| "Screenshot x coordinate overflowed desktop coordinates.".to_string())?;
+    let desktop_y = i64::from(mapping.origin_y)
+        .checked_add(scaled_y)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| "Screenshot y coordinate overflowed desktop coordinates.".to_string())?;
+    Ok((desktop_x, desktop_y))
+}
+
+/// Build a best-effort logical AT-SPI -> physical X11 transform by aligning
+/// the app's top-level accessible frame with the window geometry reported by
+/// the X11 window backend. Chromium exposes AT-SPI bounds in device-independent
+/// pixels when desktop scaling is enabled, while xdotool and pointer injection
+/// use physical pixels.
+fn atspi_coordinate_map(
+    nodes: &[AccessibilityNode],
+    window: &WindowInfo,
+) -> Option<AtspiCoordinateMap> {
+    if !matches!(
+        window.backend.as_str(),
+        crate::windowing::XDOTOOL_BACKEND | crate::windowing::I3_BACKEND
+    ) {
+        return None;
+    }
+    let physical = window.bounds.as_ref()?;
+    let physical_x = physical.x?;
+    let physical_y = physical.y?;
+    if physical.width == 0 || physical.height == 0 {
+        return None;
+    }
+
+    let usable = |node: &&AccessibilityNode| {
+        let Some(bounds) = node.bounds.as_ref() else {
+            return false;
+        };
+        bounds.x > i32::MIN / 2 && bounds.y > i32::MIN / 2 && bounds.width > 0 && bounds.height > 0
+    };
+    let area = |node: &&AccessibilityNode| {
+        let bounds = node.bounds.as_ref().expect("filtered bounds");
+        i64::from(bounds.width) * i64::from(bounds.height)
+    };
+    let logical = nodes
+        .iter()
+        .filter(usable)
+        .filter(|node| {
+            matches!(
+                node.role.trim().to_ascii_lowercase().as_str(),
+                "frame" | "window" | "dialog"
+            )
+        })
+        .max_by_key(area)
+        .or_else(|| {
+            nodes
+                .iter()
+                .filter(usable)
+                .filter(|node| node.depth <= 1)
+                .max_by_key(area)
+        })?
+        .bounds
+        .as_ref()?;
+
+    let scale_x = f64::from(physical.width) / f64::from(logical.width);
+    let scale_y = f64::from(physical.height) / f64::from(logical.height);
+    let scale = scale_x.min(scale_y);
+    let ratio_spread = (scale_x - scale_y).abs() / scale_x.max(scale_y);
+    if !scale.is_finite() || !(0.5..=4.0).contains(&scale) || ratio_spread > 0.20 {
+        return None;
+    }
+
+    Some(AtspiCoordinateMap {
+        logical_x: logical.x,
+        logical_y: logical.y,
+        physical_x,
+        physical_y,
+        scale,
+    })
+}
+
+fn map_atspi_point(mapping: AtspiCoordinateMap, point: (i32, i32)) -> Option<(i32, i32)> {
+    let x = f64::from(mapping.physical_x)
+        + f64::from(point.0.checked_sub(mapping.logical_x)?) * mapping.scale;
+    let y = f64::from(mapping.physical_y)
+        + f64::from(point.1.checked_sub(mapping.logical_y)?) * mapping.scale;
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < f64::from(i32::MIN)
+        || x > f64::from(i32::MAX)
+        || y < f64::from(i32::MIN)
+        || y > f64::from(i32::MAX)
+    {
+        return None;
+    }
+    Some((x.round() as i32, y.round() as i32))
 }
 
 fn compact_accessibility_tree(nodes: Vec<AccessibilityNode>) -> Vec<AccessibilityNode> {
@@ -4570,6 +4941,145 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_coordinates_scale_to_physical_desktop_pixels() {
+        let mapping = ScreenshotCoordinateMap {
+            image_width: 1920,
+            image_height: 1080,
+            coordinate_width: 2560,
+            coordinate_height: 1440,
+            origin_x: 0,
+            origin_y: 0,
+        };
+
+        assert_eq!(
+            screenshot_point_to_desktop(mapping, 900, 300).unwrap(),
+            (1200, 400)
+        );
+        assert_eq!(
+            screenshot_point_to_desktop(mapping, 1919, 1079).unwrap(),
+            (2559, 1439)
+        );
+    }
+
+    #[test]
+    fn cropped_screenshot_coordinates_include_desktop_origin() {
+        let mapping = ScreenshotCoordinateMap {
+            image_width: 960,
+            image_height: 540,
+            coordinate_width: 1280,
+            coordinate_height: 720,
+            origin_x: 100,
+            origin_y: 50,
+        };
+
+        assert_eq!(
+            screenshot_point_to_desktop(mapping, 480, 270).unwrap(),
+            (740, 410)
+        );
+    }
+
+    #[test]
+    fn screenshot_coordinate_conversion_requires_latest_mapping_and_in_range_points() {
+        let backend = ComputerUseLinux::default();
+        let missing = backend.screenshot_point_to_desktop(10, 20).unwrap_err();
+        assert!(missing.contains("Call get_app_state or screenshot"));
+
+        let mapping = ScreenshotCoordinateMap {
+            image_width: 1920,
+            image_height: 1080,
+            coordinate_width: 2560,
+            coordinate_height: 1440,
+            origin_x: 0,
+            origin_y: 0,
+        };
+        *backend.last_screenshot_coordinates.lock().unwrap() = Some(mapping);
+        let outside = backend.screenshot_point_to_desktop(1920, 100).unwrap_err();
+        assert!(outside.contains("outside the most recently returned image"));
+    }
+
+    #[test]
+    fn atspi_bounds_scale_to_physical_x11_window_coordinates() {
+        let backend = ComputerUseLinux::default();
+        let mut frame = node(
+            1,
+            Some(Bounds {
+                x: 0,
+                y: 0,
+                width: 1707,
+                height: 922,
+            }),
+        );
+        frame.role = "frame".to_string();
+        let mut button = node(
+            7,
+            Some(Bounds {
+                x: 750,
+                y: 25,
+                width: 100,
+                height: 40,
+            }),
+        );
+        button.depth = 1;
+        button.parent_index = Some(1);
+        let mut window = window_with_bounds(1, 0, 0, 2560, 1440);
+        window.backend = crate::windowing::XDOTOOL_BACKEND.to_string();
+
+        backend.cache_nodes_for_window(&[frame, button], Some(&window));
+
+        assert_eq!(
+            backend
+                .resolve_optional_target_point(None, None, Some(7))
+                .unwrap(),
+            Some((1200, 67))
+        );
+    }
+
+    #[test]
+    fn atspi_primary_action_fallback_uses_physical_x11_coordinates() {
+        let backend = ComputerUseLinux::default();
+        let mut frame = node(
+            1,
+            Some(Bounds {
+                x: 0,
+                y: 0,
+                width: 1707,
+                height: 922,
+            }),
+        );
+        frame.role = "frame".to_string();
+        let mut button = node_with_actions(
+            7,
+            Some(Bounds {
+                x: 750,
+                y: 25,
+                width: 100,
+                height: 40,
+            }),
+            vec![click_action()],
+        );
+        button.depth = 1;
+        button.parent_index = Some(1);
+        let mut window = window_with_bounds(1, 0, 0, 2560, 1440);
+        window.backend = crate::windowing::XDOTOOL_BACKEND.to_string();
+        backend.cache_nodes_for_window(&[frame, button], Some(&window));
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(matches!(
+            target,
+            ClickTarget::PrimaryAction {
+                fallback_coordinates: Some((1200, 67)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn coordinate_target_overrides_cached_element_index() {
         let backend = ComputerUseLinux::default();
         backend.cache_nodes(&[node(
@@ -4677,10 +5187,12 @@ mod tests {
                 object_ref,
                 action_name,
                 action_index,
+                fallback_coordinates,
             } => {
                 assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
                 assert_eq!(action_name.as_deref(), Some("Click"));
                 assert_eq!(action_index, 0);
+                assert_eq!(fallback_coordinates, None);
             }
             ClickTarget::Coordinates(_, _) => {
                 panic!("expected AT-SPI primary-action fallback")
@@ -4719,10 +5231,12 @@ mod tests {
                 object_ref,
                 action_name,
                 action_index,
+                fallback_coordinates,
             } => {
                 assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
                 assert_eq!(action_name.as_deref(), Some("Click"));
                 assert_eq!(action_index, 0);
+                assert_eq!(fallback_coordinates, None);
             }
             ClickTarget::Coordinates(_, _) => {
                 panic!("expected AT-SPI primary-action fallback")
@@ -5146,7 +5660,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_click_selector_resolves_coordinates() {
+    fn semantic_click_selector_prefers_native_action_with_coordinate_fallback() {
         let backend = ComputerUseLinux::default();
         let mut button = node_with_actions(
             7,
@@ -5169,7 +5683,14 @@ mod tests {
             })
             .unwrap();
 
-        assert!(matches!(target, ClickTarget::Coordinates(60, 40)));
+        assert!(matches!(
+            target,
+            ClickTarget::PrimaryAction {
+                action_index: 0,
+                fallback_coordinates: Some((60, 40)),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -5224,6 +5745,7 @@ mod tests {
             wm_class: None,
             window_title: None,
             relative: Some(true),
+            coordinate_space: CoordinateSpace::Desktop,
         };
         let focus = WindowFocusResult {
             requested_window: window_with_bounds(1, 100, 200, 800, 600),
@@ -5252,6 +5774,7 @@ mod tests {
             wm_class: None,
             window_title: None,
             relative: None,
+            coordinate_space: CoordinateSpace::Desktop,
         };
         let focus = WindowFocusResult {
             requested_window: window_with_bounds(1, 100, 200, 800, 600),
@@ -5280,6 +5803,7 @@ mod tests {
             wm_class: None,
             window_title: None,
             relative: None,
+            coordinate_space: CoordinateSpace::Desktop,
         };
         let mut window = window_with_bounds(1, 0, 0, 1, 1);
         window.bounds = None;
@@ -5311,6 +5835,7 @@ mod tests {
             wm_class: None,
             window_title: None,
             relative: Some(true),
+            coordinate_space: CoordinateSpace::Desktop,
         };
         let focus = WindowFocusResult {
             requested_window: window_with_bounds(1, 100, 200, 800, 600),

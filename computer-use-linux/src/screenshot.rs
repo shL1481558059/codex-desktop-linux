@@ -55,6 +55,12 @@ pub struct ScreenshotCapture {
     pub coordinate_width: u32,
     /// Coordinate-space height before payload downscaling.
     pub coordinate_height: u32,
+    /// Desktop physical-pixel origin represented by coordinate (0, 0) in the
+    /// returned image. Non-zero for a screenshot cropped to a window.
+    pub coordinate_origin_x: i32,
+    /// Desktop physical-pixel origin represented by coordinate (0, 0) in the
+    /// returned image. Non-zero for a screenshot cropped to a window.
+    pub coordinate_origin_y: i32,
     /// Returned pixels per coordinate-space pixel.
     pub scale: f32,
     pub resized: bool,
@@ -282,6 +288,8 @@ pub fn prepare_screenshot_payload(
         height,
         coordinate_width,
         coordinate_height,
+        coordinate_origin_x: 0,
+        coordinate_origin_y: 0,
         scale,
         resized: width != coordinate_width || height != coordinate_height,
         bytes: bytes.len(),

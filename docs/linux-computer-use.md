@@ -65,6 +65,27 @@ or screenshots:
 - Hyprland: `xdg-desktop-portal-hyprland`
 - GNOME: usually available by default
 
+## Screenshot Coordinates
+
+Coordinates chosen from a returned `get_app_state` or `screenshot` image must
+be sent with `coordinate_space="screenshot"`:
+
+```json
+{"x": 800, "y": 45, "coordinate_space": "screenshot", "app_id": "Google-chrome"}
+```
+
+The backend caches metadata for the most recently returned image and converts
+its resized pixels and any window-crop origin into physical desktop pixels.
+Call `get_app_state` or `screenshot` immediately before the coordinate action;
+a later screenshot replaces the cached mapping. `coordinate_space="desktop"`
+remains the default for callers that already provide physical desktop pixels.
+
+For element-targeted left clicks, native AT-SPI actions are preferred. On
+scaled X11 desktops, any necessary AT-SPI coordinate fallback is aligned to the
+physical X11 window before pointer input. When controlling Chrome, prefer the
+Chrome-specific browser control integration when it is available; use Linux
+Computer Use for desktop chrome, native dialogs, and screenshot-only targets.
+
 ## Verify Readiness
 
 Once Computer Use is visible in the Codex UI, ask Codex:
