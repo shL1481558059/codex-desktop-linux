@@ -32,6 +32,18 @@ module.exports = [
     apply: applyLinuxComputerUseRendererAvailabilityPatch,
   }),
   webviewAssetPatch({
+    id: "linux-computer-use-plugin-directory-availability",
+    phase: "webview-asset",
+    order: 1102,
+    ciPolicy: "opt-in",
+    enabled: (context) => context.enableComputerUseUi,
+    pattern:
+      /^app-initial~app-main~new-thread-panel-page~onboarding-page~appgen-library-page~hotkey-windo~nrw3o0ql-[^.]+\.js$/,
+    missingDescription: "current Computer Use plugin directory availability bundle",
+    skipDescription: "Linux Computer Use plugin directory availability patch",
+    apply: applyLinuxComputerUseRendererAvailabilityPatch,
+  }),
+  webviewAssetPatch({
     id: "linux-computer-use-install-flow",
     phase: "webview-asset",
     order: 1110,

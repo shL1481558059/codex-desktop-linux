@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__computer_use__(get_app_state|screenshot)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/repair-json-arguments.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

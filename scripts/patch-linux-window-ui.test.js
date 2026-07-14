@@ -974,6 +974,7 @@ test("default core patch descriptors are grouped and unique", () => {
     "local-environment-action-modal-draft",
     "linux-computer-use-ui-availability",
     "linux-computer-use-settings-availability",
+    "linux-computer-use-plugin-directory-availability",
     "linux-computer-use-install-flow",
     "linux-app-updater-bridge",
     "browser-annotation-screenshot",
@@ -7487,7 +7488,7 @@ test("keeps object-helper Computer Use host compatibility on Linux when platform
   );
 });
 
-test("Computer Use availability descriptors track main and settings bundles separately", () => {
+test("Computer Use availability descriptors track main settings and plugin directory bundles separately", () => {
   const descriptors = require("./patches/core/all-linux/webview/computer-use-ui/patch.js");
   const mainDescriptor = descriptors.find(
     (descriptor) => descriptor.id === "linux-computer-use-ui-availability",
@@ -7495,7 +7496,13 @@ test("Computer Use availability descriptors track main and settings bundles sepa
   const settingsDescriptor = descriptors.find(
     (descriptor) => descriptor.id === "linux-computer-use-settings-availability",
   );
+  const pluginDirectoryDescriptor = descriptors.find(
+    (descriptor) => descriptor.id === "linux-computer-use-plugin-directory-availability",
+  );
 
+  assert.ok(mainDescriptor);
+  assert.ok(settingsDescriptor);
+  assert.ok(pluginDirectoryDescriptor);
   assert.match("computer-use-settings-B1QCeMSP.js", settingsDescriptor.pattern);
   assert.doesNotMatch("computer-use-settings-B1QCeMSP.js", mainDescriptor.pattern);
   assert.match(
@@ -7506,6 +7513,23 @@ test("Computer Use availability descriptors track main and settings bundles sepa
     "app-initial~app-main~new-thread-panel-page~onboarding-page~login-route~appgen-library-page~~gpgl9un5-_t04Xpau.js",
     mainDescriptor.pattern,
   );
+  assert.match(
+    "app-initial~app-main~new-thread-panel-page~onboarding-page~appgen-library-page~hotkey-windo~nrw3o0ql-CI1_Z0oj.js",
+    pluginDirectoryDescriptor.pattern,
+  );
+  assert.doesNotMatch(
+    "app-initial~app-main~quick-chat-window-page~work-home-page~chatgpt-conversation-page-BqLP6EDd.js",
+    pluginDirectoryDescriptor.pattern,
+  );
+  assert.doesNotMatch(
+    "app-initial~app-main~new-thread-panel-page~onboarding-page~appgen-library-page~hotkey-windo~eq487jm7-BvlxyIFK.js",
+    pluginDirectoryDescriptor.pattern,
+  );
+  assert.doesNotMatch(
+    "app-initial~app-main~new-thread-panel-page~onboarding-page~appgen-library-page~hotkey-windo~pel57pe6-DetEkMu0.js",
+    pluginDirectoryDescriptor.pattern,
+  );
+  assert.doesNotMatch("computer-use-settings-B1QCeMSP.js", pluginDirectoryDescriptor.pattern);
   assert.doesNotMatch("use-model-settings-5PHNqYL4.js", settingsDescriptor.pattern);
   assert.doesNotMatch("use-is-plugins-enabled-current.js", settingsDescriptor.pattern);
   assert.doesNotMatch("use-native-apps.electron-DhuUEit1.js", settingsDescriptor.pattern);
@@ -7539,6 +7563,12 @@ test("Computer Use patch report does not hide a missing main availability bundle
       assert.equal(
         report.patches.find((patch) => patch.name === "linux-computer-use-settings-availability")?.status,
         "applied",
+      );
+      assert.equal(
+        report.patches.find(
+          (patch) => patch.name === "linux-computer-use-plugin-directory-availability",
+        )?.status,
+        "skipped-optional",
       );
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -8490,7 +8520,7 @@ test("missing icon asset skips only icon patches", () => {
   }
 });
 
-test("patchExtractedApp scans current Computer Use settings bundles when UI is enabled", () => {
+test("patchExtractedApp scans current Computer Use settings and plugin directory bundles when UI is enabled", () => {
   withIsolatedHome(() => {
     process.env[COMPUTER_USE_UI_ENV_VAR] = "1";
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-computer-use-apps-assets-test-"));
@@ -8531,6 +8561,14 @@ test("patchExtractedApp scans current Computer Use settings bundles when UI is e
       fs.writeFileSync(
         path.join(
           assetsDir,
+          "app-initial~app-main~new-thread-panel-page~onboarding-page~appgen-library-page~hotkey-windo~nrw3o0ql-current.js",
+        ),
+        "function Oge(e){return e===`macOS`||e===`windows`}" +
+          "function pluginDirectory(e){let t=(0,l.c)(16),{enabled:n,hostId:r}=e,i=n===void 0?!0:n,{isLoading:a,platform:o}=s(),f=u(`1506311413`),c;t[0]===r?c=t[1]:(c={featureName:`computer_use`,hostId:r},t[0]=r,t[1]=c);let d=p(c),v=o===`windows`&&!a,y=i&&v,b;t[2]===y?b=t[3]:(b={enabled:y},t[2]=y,t[3]=b);let w=m(b),g=d.isLoading||v&&w.isLoading,h=d.enabled&&(!v||w.enabled),x;t[4]!==h||t[5]!==i||t[6]!==g||t[7]!==f||t[8]!==a||t[9]!==o?(x=jge({areRequiredFeaturesEnabled:h,enabled:i,isAnyFeatureLoading:g,isComputerUseGateEnabled:f,isHostCompatiblePlatform:Oge(o),isPlatformLoading:a,windowType:`electron`}),t[4]=h,t[5]=i,t[6]=g,t[7]=f,t[8]=a,t[9]=o,t[10]=x):x=t[10];return x}",
+      );
+      fs.writeFileSync(
+        path.join(
+          assetsDir,
           "app-initial~app-main~onboarding-page~hotkey-window-thread-page~quick-chat-window-page~chatg~gwqc41kz-current.js",
         ),
         "function _p(e){return e===`macOS`||e===`windows`}" +
@@ -8555,6 +8593,16 @@ test("patchExtractedApp scans current Computer Use settings bundles when UI is e
       assert.match(
         fs.readFileSync(path.join(assetsDir, "computer-use-settings-plugins-current.js"), "utf8"),
         /v=g\(\{enabled:a,isComputerUseFeatureEnabled:s===`linux`\|\|_\.enabled,isComputerUseFeatureLoading:s!==`linux`&&_\.isLoading,isComputerUseGateEnabled:s===`linux`\|\|d,isHostCompatiblePlatform:s===`linux`\|\|p\(s\),isHostLocal:c,isPlatformLoading:o,windowType:`electron`\}\)/,
+      );
+      assert.match(
+        fs.readFileSync(
+          path.join(
+            assetsDir,
+            "app-initial~app-main~new-thread-panel-page~onboarding-page~appgen-library-page~hotkey-windo~nrw3o0ql-current.js",
+          ),
+          "utf8",
+        ),
+        /x=jge\(\{areRequiredFeaturesEnabled:o===`linux`\|\|h,enabled:i,isAnyFeatureLoading:o===`linux`\?!1:g,isComputerUseGateEnabled:o===`linux`\|\|f,isHostCompatiblePlatform:o===`linux`\|\|Oge\(o\),isPlatformLoading:a,windowType:`electron`\}\)/,
       );
       assert.match(
         fs.readFileSync(

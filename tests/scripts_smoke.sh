@@ -4530,6 +4530,111 @@ test_bundled_plugin_builders_accept_prebuilt_binaries() {
         || fail "Expected the bundled Computer Use plugin to use the selected ChatGPT icon"
     [ ! -e "$staged_plugins/computer-use/bin/computer-use-linux-cosmic" ] \
         || fail "Vendored/prebuilt Computer Use staging must not add the external helper alias"
+    assert_file_exists "$staged_plugins/computer-use/hooks/repair-json-arguments.py"
+    assert_file_exists "$staged_plugins/computer-use/hooks.json"
+}
+
+test_computer_use_json_argument_repair_hook() {
+    info "Checking Computer Use JSON argument repair hook"
+    local hook="$REPO_DIR/plugins/openai-bundled/plugins/computer-use/hooks/repair-json-arguments.py"
+    local plugin_root="$REPO_DIR/plugins/openai-bundled/plugins/computer-use"
+    local hooks_config="$plugin_root/hooks.json"
+    local plugin_manifest="$plugin_root/.codex-plugin/plugin.json"
+    assert_file_exists "$hook"
+    assert_file_exists "$hooks_config"
+    assert_file_exists "$plugin_manifest"
+
+    python3 - "$hook" "$hooks_config" "$plugin_manifest" <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+hook = pathlib.Path(sys.argv[1])
+hooks_config = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+plugin_manifest = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+if plugin_manifest.get("version") != "0.1.2-linux-alpha4":
+    raise SystemExit("Computer Use plugin version must refresh the cached Hook bundle")
+matcher = hooks_config["hooks"]["PreToolUse"][0]
+if matcher["matcher"] != r"^mcp__computer_use__(get_app_state|screenshot)$":
+    raise SystemExit("Computer Use hook matcher must stay limited to screenshot and get_app_state")
+command = matcher["hooks"][0]["command"]
+if command != 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/repair-json-arguments.py"':
+    raise SystemExit("Computer Use hook must resolve its script from the installed plugin root")
+
+def run(tool_name, tool_input):
+    event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+    }
+    completed = subprocess.run(
+        ["python3", str(hook)],
+        input=json.dumps(event),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return json.loads(completed.stdout)
+
+def updated_input(result):
+    return result.get("hookSpecificOutput", {}).get("updatedInput")
+
+exact = run(
+    "mcp__computer_use__get_app_state",
+    '{"app_id":"Google-chrome","window_id":136314884,"format":jpeg,"quality":70}',
+)
+if updated_input(exact) != {
+    "app_id": "Google-chrome",
+    "window_id": 136314884,
+    "format": "jpeg",
+    "quality": 70,
+}:
+    raise SystemExit(f"exact malformed payload was not repaired: {exact}")
+if exact["hookSpecificOutput"].get("permissionDecision") != "allow":
+    raise SystemExit("updatedInput must be paired with permissionDecision:allow")
+if exact["hookSpecificOutput"].get("hookEventName") != "PreToolUse":
+    raise SystemExit("updatedInput must identify the PreToolUse event")
+
+with tempfile.TemporaryDirectory() as unrelated_cwd:
+    command_event = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "mcp__computer_use__screenshot",
+        "tool_input": '{"format":jpeg}',
+    }
+    command_result = subprocess.run(
+        command,
+        shell=True,
+        cwd=unrelated_cwd,
+        env={**os.environ, "CLAUDE_PLUGIN_ROOT": str(hook.parent.parent)},
+        input=json.dumps(command_event),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    if updated_input(json.loads(command_result.stdout)) != {"format": "jpeg"}:
+        raise SystemExit("Hook command failed outside the plugin working directory")
+
+png = run("mcp__computer_use__screenshot", '{"format":png}')
+if updated_input(png) != {"format": "png"}:
+    raise SystemExit(f"png malformed payload was not repaired: {png}")
+
+unchanged = [
+    ("mcp__computer_use__screenshot", '{"format":"jpeg"}'),
+    ("mcp__computer_use__screenshot", '{"format":webp}'),
+    ("mcp__computer_use__screenshot", '{"label":"\\\"format\\\":jpeg"}'),
+    ("mcp__computer_use__screenshot", '{"nested":{"format":jpeg}}'),
+    ("mcp__computer_use__screenshot", '{"format":jpeg,"format":png}'),
+    ("mcp__computer_use__screenshot", '{"format":jpeg,}'),
+    ("mcp__computer_use__other", '{"format":jpeg}'),
+]
+for tool_name, tool_input in unchanged:
+    result = run(tool_name, tool_input)
+    if updated_input(result) is not None:
+        raise SystemExit(f"hook changed an out-of-scope payload: {tool_name} {tool_input} -> {result}")
+PY
 }
 
 test_bundled_plugin_system_computer_use_preserves_cosmic_helper_name() {
@@ -9519,6 +9624,7 @@ main() {
     test_native_module_rebuild_uses_local_electron_rebuild_toolchain
     test_native_module_rebuild_accepts_prebuilt_source
     test_bundled_plugin_builders_accept_prebuilt_binaries
+    test_computer_use_json_argument_repair_hook
     test_notification_actions_bridge_accepts_prebuilt_binary
     test_bundled_plugin_system_computer_use_preserves_cosmic_helper_name
     test_browser_use_node_repl_fallback_runtime
