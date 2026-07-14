@@ -8,16 +8,20 @@ It supports:
 
 - app listing and accessibility trees through AT-SPI
 - screenshots through GNOME Shell DBus, the Codex GNOME Shell extension, or XDG Desktop Portal
-- window listing and focusing on GNOME, KWin/Plasma, Hyprland, COSMIC, and i3
-- keyboard, text, click, scroll, and drag input through `/dev/uinput`, XDG
-  RemoteDesktop portal, or `ydotool`
+- window listing and focusing on GNOME, KWin/Plasma, Hyprland, COSMIC, i3,
+  and generic X11 desktops through `xdotool`
+- keyboard, text, click, scroll, and drag input through `xdotool` on X11,
+  `/dev/uinput`, XDG RemoteDesktop portal on Wayland, or `ydotool`
 
 ## Runtime Dependencies
 
-Debian packages declare `at-spi2-core` as a required dependency. Apt installs
+Debian packages declare `at-spi2-core`, `xdotool`, and the `xprop` provider
+`x11-utils` as required dependencies. Apt installs
 the AT-SPI D-Bus activation service (`org.a11y.Bus`) automatically with Codex.
 Other package formats or manual installations must provide the equivalent
-AT-SPI core package when element-aware accessibility trees are required.
+AT-SPI core package when element-aware accessibility trees are required. On
+X11, `xdotool` supplies window enumeration, exact focus, and input without a
+privileged `uinput` daemon.
 
 Install `ydotool` when you need the fallback input path:
 

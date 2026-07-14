@@ -46,6 +46,7 @@ use tokio::{
 use zbus::{Connection as ZbusConnection, Proxy as ZbusProxy};
 
 const YDOTOOL_TIMEOUT: Duration = Duration::from_secs(10);
+const XDOTOOL_TIMEOUT: Duration = Duration::from_secs(10);
 const YDOTOOL_TYPE_CHARS_PER_SECOND: u64 = 20;
 const KDE_CLIPBOARD_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
 const KDE_KLIPPER_SERVICE: &str = "org.kde.klipper";
@@ -632,7 +633,7 @@ impl ComputerUseLinux {
         };
         let button = mouse_button_code(params.button.as_deref());
         let click_count = params.click_count.unwrap_or(1).clamp(1, 10).to_string();
-        // Preferred backend: the uinput absolute pointer. Unlike ydotool's
+        // After the native X11 xdotool path, prefer the uinput absolute pointer. Unlike ydotool's
         // relative-only device (faked `--absolute` via pin-to-corner + relative
         // move, which acceleration + fractional scaling distort) and unlike the
         // portal (per-monitor coordinate scaling + an approval dialog), the
@@ -640,6 +641,20 @@ impl ComputerUseLinux {
         // Off-screen coordinates "succeed" at the uinput layer while landing on
         // no visible pixel — surface that instead of a silent no-op.
         let off_screen_note = self.off_screen_note_for_point(x, y).await;
+        if self.should_prefer_xdotool_input_backend() {
+            let result = run_xdotool(&xdotool_click_args(
+                x,
+                y,
+                params.button.as_deref(),
+                params.click_count.unwrap_or(1).clamp(1, 10),
+            ))
+            .await
+            .map(|output| vec![output]);
+            return Json(with_notes(
+                action_result_for_backend("click", result, received, "xdotool"),
+                off_screen_note,
+            ));
+        }
         if self
             .try_abs_click(
                 x,
@@ -928,6 +943,20 @@ impl ComputerUseLinux {
             None => None,
         };
 
+        if self.should_prefer_xdotool_input_backend() {
+            let result = run_xdotool(&xdotool_scroll_args(
+                target_point,
+                params.direction.as_str(),
+                units,
+            ))
+            .await
+            .map(|output| vec![output]);
+            return Json(with_notes(
+                action_result_for_backend("scroll", result, received, "xdotool"),
+                off_screen_note,
+            ));
+        }
+
         if let Some(session) = self.cached_portal_pointer_session() {
             match portal_scroll(&session, target_point, direction, units).await {
                 Ok(()) => {
@@ -1008,7 +1037,20 @@ impl ComputerUseLinux {
     )]
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
-        // Preferred backend: the uinput absolute pointer (accurate landing).
+        if self.should_prefer_xdotool_input_backend() {
+            let result = run_xdotool(&xdotool_drag_args(
+                params.start_x,
+                params.start_y,
+                params.end_x,
+                params.end_y,
+            ))
+            .await
+            .map(|output| vec![output]);
+            return Json(action_result_for_backend(
+                "drag", result, received, "xdotool",
+            ));
+        }
+        // After the native X11 xdotool path, prefer the uinput absolute pointer.
         if self.ensure_abs_pointer().await {
             let abs_pointer = Arc::clone(&self.abs_pointer);
             let dragged = tokio::task::spawn_blocking(move || {
@@ -1131,6 +1173,25 @@ impl ComputerUseLinux {
                 received,
             });
         };
+        if self.should_prefer_xdotool_input_backend() {
+            let key = xdotool_key_chord(&params.key)
+                .expect("xdotool and ydotool key grammars must stay aligned");
+            let result = run_xdotool(&["key".to_string(), "--clearmodifiers".to_string(), key])
+                .await
+                .map(|output| vec![output]);
+            let mut output = action_result_with_focus_for_backend(
+                "press_key",
+                result,
+                received,
+                focus.clone(),
+                "xdotool",
+            );
+            if output.ok && focus.is_some() {
+                let notes = self.input_landing_notes(focus.as_ref(), false).await;
+                output = with_notes(output, notes);
+            }
+            return Json(output);
+        }
         let mut args = vec!["key".to_string()];
         args.extend(key_events);
         let result = run_ydotool(&args).await.map(|output| vec![output]);
@@ -1169,6 +1230,30 @@ impl ComputerUseLinux {
                 });
             }
         };
+        if self.should_prefer_xdotool_input_backend() {
+            let result = run_xdotool(&[
+                "type".to_string(),
+                "--clearmodifiers".to_string(),
+                "--delay".to_string(),
+                "1".to_string(),
+                "--".to_string(),
+                params.text.clone(),
+            ])
+            .await
+            .map(|output| vec![output]);
+            let mut output = action_result_with_focus_for_backend(
+                "type_text",
+                result,
+                received,
+                focus.clone(),
+                "xdotool",
+            );
+            if output.ok && focus.is_some() {
+                let notes = self.input_landing_notes(focus.as_ref(), true).await;
+                output = with_notes(output, notes);
+            }
+            return Json(output);
+        }
         if self.should_prefer_kde_clipboard_text_backend() {
             match self.ensure_portal_keyboard_session().await {
                 Ok(Some(session)) => {
@@ -1305,7 +1390,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.3.1-linux-alpha1",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state with only the needed app/window selectors; keep the first call on the default PNG and omit format/quality. Tool arguments must always be strict JSON. Enum values such as jpeg and png are JSON strings: use {\"format\":\"jpeg\",\"quality\":70}, never a bare value such as {\"format\":jpeg}. If a tool call reports a JSON argument parse error, retry it once with strict JSON instead of ending the task. If diagnostics report disabled accessibility on GNOME, call setup_accessibility before asking the user to retry. If AT-SPI is unavailable on a non-GNOME desktop such as Deepin, do not repeatedly call setup_accessibility; continue with screenshots and coordinate input when readiness confirms an input backend. Use list_windows/focused_window before targeted keyboard input when window introspection is available. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, a strict JSON format string, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state with only the needed app/window selectors; keep the first call on the default PNG and omit format/quality. Tool arguments must always be strict JSON. Enum values such as jpeg and png are JSON strings: use {\"format\":\"jpeg\",\"quality\":70}, never a bare value such as {\"format\":jpeg}. If a tool call reports a JSON argument parse error, retry it once with strict JSON instead of ending the task. If diagnostics report disabled accessibility on GNOME, call setup_accessibility before asking the user to retry. If AT-SPI is unavailable on a non-GNOME desktop such as Deepin, do not repeatedly call setup_accessibility; continue with screenshots and coordinate input when readiness confirms an input backend. Use list_windows/focused_window before targeted keyboard input when window introspection is available. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send exact window focus plus pointer/keyboard input through xdotool on X11, send coordinate or element-targeted input through the Wayland remote desktop portal when available, and use ydotool as a fallback. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, a strict JSON format string, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -1899,11 +1984,29 @@ struct ActionOutput {
 }
 
 impl ComputerUseLinux {
+    fn is_x11_session(&self) -> bool {
+        crate::diagnostics::hydrate_session_bus_env();
+        env::var("XDG_SESSION_TYPE")
+            .ok()
+            .is_some_and(|value| value.eq_ignore_ascii_case("x11"))
+            || (env::var_os("DISPLAY").is_some() && env::var_os("WAYLAND_DISPLAY").is_none())
+    }
+
     fn is_wayland_session(&self) -> bool {
         crate::diagnostics::hydrate_session_bus_env();
         env::var("XDG_SESSION_TYPE")
             .ok()
             .is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
+    }
+
+    fn should_prefer_xdotool_input_backend(&self) -> bool {
+        self.is_x11_session()
+            && !env_flag_enabled_any(&[
+                "COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER",
+                "CODEX_COMPUTER_USE_FORCE_YDOTOOL_POINTER",
+                "COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD",
+                "CODEX_COMPUTER_USE_FORCE_YDOTOOL_KEYBOARD",
+            ])
     }
 
     // The Wayland remote-desktop portal is now a *fallback* for input: when a
@@ -3113,12 +3216,21 @@ fn action_result(
     result: std::result::Result<Vec<Output>, String>,
     received: Option<serde_json::Value>,
 ) -> ActionOutput {
+    action_result_for_backend(action, result, received, "ydotool")
+}
+
+fn action_result_for_backend(
+    action: &str,
+    result: std::result::Result<Vec<Output>, String>,
+    received: Option<serde_json::Value>,
+    backend: &str,
+) -> ActionOutput {
     match result {
         Ok(_) => ActionOutput {
             ok: true,
             implemented: true,
             action: action.to_string(),
-            message: "Action sent through ydotool.".to_string(),
+            message: format!("Action sent through {backend}."),
             received,
         },
         Err(message) => ActionOutput {
@@ -3138,6 +3250,19 @@ fn action_result_with_focus(
     focus: Option<WindowFocusResult>,
 ) -> ActionOutput {
     with_focus_context(action_result(action, result, received), focus)
+}
+
+fn action_result_with_focus_for_backend(
+    action: &str,
+    result: std::result::Result<Vec<Output>, String>,
+    received: Option<serde_json::Value>,
+    focus: Option<WindowFocusResult>,
+    backend: &str,
+) -> ActionOutput {
+    with_focus_context(
+        action_result_for_backend(action, result, received, backend),
+        focus,
+    )
 }
 
 fn successful_action_with_focus(
@@ -3269,6 +3394,84 @@ fn wheel_mousemove_args(dx: i32, dy: i32) -> Vec<String> {
     ]
 }
 
+fn xdotool_click_args(x: i32, y: i32, button: Option<&str>, click_count: u32) -> Vec<String> {
+    vec![
+        "mousemove".to_string(),
+        "--sync".to_string(),
+        "--".to_string(),
+        x.to_string(),
+        y.to_string(),
+        "click".to_string(),
+        "--repeat".to_string(),
+        click_count.to_string(),
+        "--delay".to_string(),
+        "50".to_string(),
+        xdotool_mouse_button(button).to_string(),
+    ]
+}
+
+fn xdotool_scroll_args(
+    target_point: Option<(i32, i32)>,
+    direction: &str,
+    units: i32,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some((x, y)) = target_point {
+        args.extend([
+            "mousemove".to_string(),
+            "--sync".to_string(),
+            "--".to_string(),
+            x.to_string(),
+            y.to_string(),
+        ]);
+    }
+    let button = match direction.to_ascii_lowercase().as_str() {
+        "up" => 4,
+        "down" => 5,
+        "left" => 6,
+        "right" => 7,
+        _ => 5,
+    };
+    args.extend([
+        "click".to_string(),
+        "--repeat".to_string(),
+        units.max(1).to_string(),
+        "--delay".to_string(),
+        "25".to_string(),
+        button.to_string(),
+    ]);
+    args
+}
+
+fn xdotool_drag_args(start_x: i32, start_y: i32, end_x: i32, end_y: i32) -> Vec<String> {
+    vec![
+        "mousemove".to_string(),
+        "--sync".to_string(),
+        "--".to_string(),
+        start_x.to_string(),
+        start_y.to_string(),
+        "mousedown".to_string(),
+        "1".to_string(),
+        "mousemove".to_string(),
+        "--sync".to_string(),
+        "--".to_string(),
+        end_x.to_string(),
+        end_y.to_string(),
+        "mouseup".to_string(),
+        "1".to_string(),
+    ]
+}
+
+fn xdotool_mouse_button(button: Option<&str>) -> u8 {
+    match button.unwrap_or("left").to_ascii_lowercase().as_str() {
+        "middle" => 2,
+        "right" => 3,
+        "side" | "back" => 8,
+        "extra" | "forward" => 9,
+        _ => 1,
+    }
+}
+
 async fn run_ydotool_sequence(
     commands: &[Vec<String>],
 ) -> std::result::Result<Vec<Output>, String> {
@@ -3280,6 +3483,22 @@ async fn run_ydotool_sequence(
         }
     }
     Ok(outputs)
+}
+
+async fn run_xdotool(args: &[String]) -> std::result::Result<Output, String> {
+    let mut command = TokioCommand::new("xdotool");
+    command.args(args);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    match command.spawn() {
+        Ok(child) => match wait_for_ydotool_output_with_timeout(child, XDOTOOL_TIMEOUT).await {
+            Ok(output) if output.status.success() => Ok(output),
+            Ok(output) => Err(command_output_error("xdotool", output)),
+            Err(error) => Err(error.replace("ydotool", "xdotool")),
+        },
+        Err(error) => Err(format!("failed to run xdotool: {error}")),
+    }
 }
 
 async fn run_ydotool(args: &[String]) -> std::result::Result<Output, String> {
@@ -3618,6 +3837,65 @@ fn key_sequence(key: &str) -> Option<Vec<String>> {
         events.push(format!("{modifier}:0"));
     }
     Some(events)
+}
+
+fn xdotool_key_chord(key: &str) -> Option<String> {
+    let parts = key
+        .split('+')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(xdotool_key_name)
+        .collect::<Option<Vec<_>>>()?;
+    (!parts.is_empty()).then(|| parts.join("+"))
+}
+
+fn xdotool_key_name(key: &str) -> Option<String> {
+    let normalized = key
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace() && *character != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let name = match normalized.as_str() {
+        "ctrl" | "control" => "ctrl",
+        "alt" | "option" => "alt",
+        "shift" => "shift",
+        "meta" | "super" | "cmd" | "command" => "super",
+        "enter" | "return" => "Return",
+        "escape" | "esc" => "Escape",
+        "tab" => "Tab",
+        "backspace" => "BackSpace",
+        "delete" | "del" => "Delete",
+        "space" => "space",
+        "home" => "Home",
+        "end" => "End",
+        "pageup" => "Page_Up",
+        "pagedown" => "Page_Down",
+        "arrowleft" | "left" => "Left",
+        "arrowright" | "right" => "Right",
+        "arrowup" | "up" => "Up",
+        "arrowdown" | "down" => "Down",
+        value
+            if value.len() == 1
+                && value
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric()) =>
+        {
+            return Some(value.to_string());
+        }
+        value
+            if value.len() <= 3
+                && value.starts_with('f')
+                && value[1..]
+                    .parse::<u8>()
+                    .ok()
+                    .is_some_and(|number| (1..=12).contains(&number)) =>
+        {
+            return Some(value.to_ascii_uppercase());
+        }
+        _ => return None,
+    };
+    Some(name.to_string())
 }
 
 fn modifier_keycode(key: &str) -> Option<u16> {
@@ -4517,6 +4795,81 @@ mod tests {
                 "930".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn xdotool_click_uses_absolute_coordinates_and_repeat_count() {
+        assert_eq!(
+            xdotool_click_args(80, 230, Some("right"), 2),
+            vec![
+                "mousemove",
+                "--sync",
+                "--",
+                "80",
+                "230",
+                "click",
+                "--repeat",
+                "2",
+                "--delay",
+                "50",
+                "3",
+            ]
+        );
+    }
+
+    #[test]
+    fn xdotool_scroll_moves_before_wheel_clicks() {
+        assert_eq!(
+            xdotool_scroll_args(Some((400, 300)), "down", 5),
+            vec![
+                "mousemove",
+                "--sync",
+                "--",
+                "400",
+                "300",
+                "click",
+                "--repeat",
+                "5",
+                "--delay",
+                "25",
+                "5",
+            ]
+        );
+    }
+
+    #[test]
+    fn xdotool_drag_holds_primary_button_between_points() {
+        assert_eq!(
+            xdotool_drag_args(10, 20, 30, 40),
+            vec![
+                "mousemove",
+                "--sync",
+                "--",
+                "10",
+                "20",
+                "mousedown",
+                "1",
+                "mousemove",
+                "--sync",
+                "--",
+                "30",
+                "40",
+                "mouseup",
+                "1",
+            ]
+        );
+    }
+
+    #[test]
+    fn xdotool_key_chord_matches_supported_key_grammar() {
+        assert_eq!(
+            xdotool_key_chord("Ctrl+Shift+P").as_deref(),
+            Some("ctrl+shift+p")
+        );
+        assert_eq!(xdotool_key_chord("ArrowLeft").as_deref(), Some("Left"));
+        assert_eq!(xdotool_key_chord("Page Down").as_deref(), Some("Page_Down"));
+        assert_eq!(xdotool_key_chord("F12").as_deref(), Some("F12"));
+        assert_eq!(xdotool_key_chord("not-a-key"), None);
     }
 
     #[test]

@@ -13,6 +13,8 @@ depends=(
     'curl'
     'unzip'
     'xdg-utils'
+    'xdotool'
+    'xorg-xprop'
     'gcc'
     'make'
     # Electron runtime libraries

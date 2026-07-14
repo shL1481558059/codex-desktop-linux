@@ -6,7 +6,7 @@ pub mod types;
 #[allow(unused_imports)]
 pub use registry::{
     COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND,
-    HYPRLAND_BACKEND, I3_BACKEND, KWIN_BACKEND, WINDOW_PERMISSION_HINT,
+    HYPRLAND_BACKEND, I3_BACKEND, KWIN_BACKEND, WINDOW_PERMISSION_HINT, XDOTOOL_BACKEND,
 };
 #[allow(unused_imports)]
 pub use target::{
@@ -25,6 +25,7 @@ mod tests {
         kwin_activate_script_source, kwin_window_id_from_uuid, kwin_window_script_source,
         parse_kwin_windows, KWIN_BACKEND,
     };
+    use super::backends::xdotool::XDOTOOL_BACKEND;
     use super::registry::{
         descriptors, list_note, COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND,
         GNOME_SHELL_INTROSPECT_BACKEND,
@@ -56,6 +57,7 @@ mod tests {
                 KWIN_BACKEND,
                 HYPRLAND_BACKEND,
                 I3_BACKEND,
+                XDOTOOL_BACKEND,
             ]
         );
     }
@@ -227,6 +229,21 @@ mod tests {
     fn i3_backend_can_exact_focus_targets() {
         let mut window = window(2, "Codex", "codex-desktop", "codex-desktop");
         window.backend = I3_BACKEND.to_string();
+
+        ensure_backend_can_focus_target(
+            &WindowTarget {
+                title: Some("Codex".to_string()),
+                ..Default::default()
+            },
+            &window,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn xdotool_backend_can_exact_focus_targets() {
+        let mut window = window(2, "Codex", "codex-desktop", "codex-desktop");
+        window.backend = XDOTOOL_BACKEND.to_string();
 
         ensure_backend_can_focus_target(
             &WindowTarget {

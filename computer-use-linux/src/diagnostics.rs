@@ -1,6 +1,6 @@
 use crate::windowing::registry::{
     self, COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND,
-    HYPRLAND_BACKEND, KWIN_BACKEND,
+    HYPRLAND_BACKEND, KWIN_BACKEND, XDOTOOL_BACKEND,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -119,6 +119,7 @@ pub struct WindowingReport {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct InputReport {
+    pub xdotool: Check,
     pub ydotool: Check,
     pub ydotoold: Check,
     pub ydotool_socket: Check,
@@ -176,7 +177,7 @@ pub fn doctor_report() -> DoctorReport {
     let portals = portal_report();
     let accessibility = accessibility_report();
     let windowing = windowing_report(&platform);
-    let input = input_report();
+    let input = input_report(&platform);
     let readiness = readiness_report(&platform, &portals, &accessibility, &windowing, &input);
 
     let capabilities = capability_map(&platform, &portals, &accessibility, &windowing, &input);
@@ -202,11 +203,17 @@ fn capability_map(
     input: &InputReport,
 ) -> CapabilityMap {
     let mut input_backends = Vec::new();
-    // Absolute uinput pointer: accurate, non-blocking of coordinates; preferred.
+    if is_x11_platform(platform) && input.xdotool.ok {
+        input_backends.push("xdotool".to_string());
+    }
+    // X11 uses xdotool first; on other sessions the absolute uinput pointer is
+    // the accurate, non-blocking coordinate backend.
     if input.uinput.ok {
         input_backends.push("abs_pointer".to_string());
     }
-    if portals.remote_desktop.ok {
+    if platform.xdg_session_type.as_deref() == Some("wayland")
+        && portal_remote_desktop_supports_input(&portals.remote_desktop)
+    {
         input_backends.push("portal".to_string());
     }
     if input.ydotool_socket.ok {
@@ -243,6 +250,13 @@ fn capability_map(
     }
     if windowing.cosmic_helper.ok {
         window_backends.push("cosmic".to_string());
+    }
+    if windowing
+        .backends
+        .get(XDOTOOL_BACKEND)
+        .is_some_and(|check| check.ok)
+    {
+        window_backends.push("xdotool".to_string());
     }
 
     let mut accessibility_backends = Vec::new();
@@ -586,6 +600,7 @@ fn windowing_report(platform: &PlatformReport) -> WindowingReport {
     let can_list_windows = probes.iter().any(|probe| probe.can_list_windows);
     let can_focus_apps = probes.iter().any(|probe| probe.can_focus_apps);
     let can_focus_windows = probes.iter().any(|probe| probe.can_focus_windows);
+    let xdotool = backend_check(XDOTOOL_BACKEND);
     let note = if can_list_windows {
         if cosmic_helper.ok && is_cosmic_wayland_platform(platform) {
             "A COSMIC Wayland window backend is available for list_windows, focused_window, and targeted input verification."
@@ -593,11 +608,15 @@ fn windowing_report(platform: &PlatformReport) -> WindowingReport {
             "A KWin/Plasma window backend is available for list_windows, focused_window, and targeted input verification."
         } else if hyprland.ok {
             "A Hyprland window backend is available for list_windows, focused_window, and targeted input verification."
-        } else {
+        } else if codex_gnome_shell_extension.ok || gnome_shell_introspect.ok {
             "A GNOME window listing backend is available for list_windows, focused_window, and targeted input verification."
+        } else if xdotool.ok && is_x11_platform(platform) {
+            "A generic X11 xdotool backend is available for list_windows, focused_window, and exact targeted input verification."
+        } else {
+            "A supported window listing backend is available for list_windows, focused_window, and targeted input verification."
         }
     } else {
-        "Window listing is unavailable or denied. Computer Use can still use screenshots, AT-SPI, and global ydotool input, but targeted window input cannot be verified. On GNOME, run setup_window_targeting to install the optional GNOME Shell extension backend. On COSMIC, ensure the bundled COSMIC helper is present and can connect to the session. On KDE/Plasma, ensure KWin exposes org.kde.KWin scripting on the session bus. On Hyprland, ensure hyprctl is available in the session."
+        "Window listing is unavailable or denied. Computer Use can still use screenshots and AT-SPI, but targeted window input cannot be verified. On X11, install xdotool and xprop. On GNOME, run setup_window_targeting to install the optional GNOME Shell extension backend. On COSMIC, ensure the bundled COSMIC helper is present and can connect to the session. On KDE/Plasma, ensure KWin exposes org.kde.KWin scripting on the session bus. On Hyprland, ensure hyprctl is available in the session."
     }
     .to_string();
 
@@ -624,8 +643,13 @@ fn check_from_backend_probe(probe: &registry::BackendProbe) -> Check {
     }
 }
 
-fn input_report() -> InputReport {
+fn input_report(platform: &PlatformReport) -> InputReport {
     InputReport {
+        xdotool: if is_x11_platform(platform) {
+            command_check("xdotool", &["getwindowfocus"])
+        } else {
+            Check::fail("xdotool input backend requires an X11 session")
+        },
         ydotool: command_path_check("ydotool"),
         ydotoold: process_check("ydotoold"),
         ydotool_socket: ydotool_socket_check(),
@@ -645,7 +669,7 @@ fn readiness_report(
     let can_query_windows = windowing.can_list_windows;
     let can_focus_apps = windowing.can_focus_apps;
     let can_focus_windows = windowing.can_focus_windows;
-    let can_send_development_input = can_send_development_input(portals, input);
+    let can_send_development_input = can_send_development_input(platform, portals, input);
 
     if !can_build_accessibility_tree {
         blockers.push(
@@ -672,7 +696,7 @@ fn readiness_report(
 
     if !can_send_development_input {
         blockers.push(
-            "Development input is unavailable; enable read/write /dev/uinput, XDG RemoteDesktop portal input, or ydotool with a connectable ydotoold socket."
+            "Development input is unavailable; install xdotool on X11, enable read/write /dev/uinput, enable XDG RemoteDesktop portal input on Wayland, or use ydotool with a connectable ydotoold socket."
                 .to_string(),
         );
     }
@@ -698,7 +722,7 @@ fn readiness_report(
     } else if !can_focus_windows {
         "Enable an exact-focus window backend before using window_id, title, or terminal-targeted input.".to_string()
     } else if !can_send_development_input {
-        "Enable a supported input backend: grant read/write /dev/uinput, enable the XDG RemoteDesktop portal, or start ydotoold with a socket accessible to this desktop user."
+        "Enable a supported input backend: install xdotool on X11, grant read/write /dev/uinput, enable the XDG RemoteDesktop portal on Wayland, or start ydotoold with a socket accessible to this desktop user."
             .to_string()
     } else {
         "Computer Use is ready: AT-SPI tree support, window targeting, and a Linux input backend are available."
@@ -728,10 +752,34 @@ fn is_gnome_platform(platform: &PlatformReport) -> bool {
             .is_some_and(|desktop| desktop.to_ascii_lowercase().contains("gnome"))
 }
 
-fn can_send_development_input(portals: &PortalReport, input: &InputReport) -> bool {
-    input.uinput.ok
-        || portals.remote_desktop.ok
+fn can_send_development_input(
+    platform: &PlatformReport,
+    portals: &PortalReport,
+    input: &InputReport,
+) -> bool {
+    (is_x11_platform(platform) && input.xdotool.ok)
+        || input.uinput.ok
+        || (platform.xdg_session_type.as_deref() == Some("wayland")
+            && portal_remote_desktop_supports_input(&portals.remote_desktop))
         || input.ydotool.ok && input.ydotoold.ok && input.ydotool_socket.ok
+}
+
+fn portal_remote_desktop_supports_input(check: &Check) -> bool {
+    if !check.ok {
+        return false;
+    }
+    let available_devices = check.detail.lines().find_map(|line| {
+        line.contains("AvailableDeviceTypes").then(|| {
+            line.split_whitespace()
+                .find_map(|token| token.parse::<u32>().ok())
+        })?
+    });
+    available_devices.is_none_or(|devices| devices != 0)
+}
+
+fn is_x11_platform(platform: &PlatformReport) -> bool {
+    platform.xdg_session_type.as_deref() == Some("x11")
+        || (platform.display.is_some() && platform.wayland_display.is_none())
 }
 
 fn is_cosmic_wayland_platform(platform: &PlatformReport) -> bool {
@@ -1085,16 +1133,24 @@ mod tests {
         } else {
             Check::fail("missing")
         };
-        input_report_parts(check.clone(), check.clone(), check.clone(), check)
+        input_report_parts(
+            Check::fail("missing xdotool"),
+            check.clone(),
+            check.clone(),
+            check.clone(),
+            check,
+        )
     }
 
     fn input_report_parts(
+        xdotool: Check,
         ydotool: Check,
         ydotoold: Check,
         ydotool_socket: Check,
         uinput: Check,
     ) -> InputReport {
         InputReport {
+            xdotool,
             ydotool,
             ydotoold,
             ydotool_socket,
@@ -1215,7 +1271,8 @@ mod tests {
             Check::ok("true"),
         );
         let windowing = windowing_report(false, false);
-        let input = input_report(false);
+        let mut input = input_report(false);
+        input.xdotool = Check::ok("/usr/bin/xdotool");
 
         let readiness = readiness_report(
             &platform,
@@ -1233,6 +1290,45 @@ mod tests {
         assert!(!readiness
             .recommended_next_step
             .contains("setup_accessibility"));
+    }
+
+    #[test]
+    fn deepin_x11_does_not_treat_portal_interface_presence_as_input_readiness() {
+        let mut platform = platform_report();
+        platform.desktop_session = Some("deepin".to_string());
+        platform.xdg_current_desktop = Some("DDE".to_string());
+        platform.xdg_session_type = Some("x11".to_string());
+        platform.wayland_display = None;
+        let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
+        let windowing = windowing_report(false, false);
+        let input = input_report(false);
+
+        let readiness = readiness_report(
+            &platform,
+            &portal_report(Check::ok("org.freedesktop.portal.RemoteDesktop")),
+            &accessibility,
+            &windowing,
+            &input,
+        );
+
+        assert!(!readiness.can_send_development_input);
+        assert!(readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("install xdotool on X11")));
+    }
+
+    #[test]
+    fn remote_desktop_portal_with_zero_device_types_is_not_an_input_backend() {
+        assert!(!portal_remote_desktop_supports_input(&Check::ok(
+            ".AvailableDeviceTypes property u 0 emits-change"
+        )));
+        assert!(portal_remote_desktop_supports_input(&Check::ok(
+            ".AvailableDeviceTypes property u 3 emits-change"
+        )));
+        assert!(!portal_remote_desktop_supports_input(&Check::fail(
+            "portal missing"
+        )));
     }
 
     #[test]
@@ -1291,6 +1387,7 @@ mod tests {
         let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
         let windowing = windowing_report(true, true);
         let input = input_report_parts(
+            Check::fail("missing xdotool"),
             Check::ok("ydotool"),
             Check::ok("ydotoold"),
             Check::ok("connectable: /tmp/.ydotool_socket"),
@@ -1315,6 +1412,7 @@ mod tests {
         let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
         let windowing = windowing_report(true, true);
         let input = input_report_parts(
+            Check::fail("missing xdotool"),
             Check::ok("ydotool"),
             Check::fail("ydotoold not running"),
             Check::fail("no connectable ydotool socket"),
@@ -1339,6 +1437,7 @@ mod tests {
         let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
         let windowing = windowing_report(true, true);
         let input = input_report_parts(
+            Check::fail("missing xdotool"),
             Check::fail("missing ydotool"),
             Check::fail("ydotoold not running"),
             Check::fail("no connectable ydotool socket"),
@@ -1363,6 +1462,7 @@ mod tests {
         let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
         let windowing = windowing_report(true, true);
         let input = input_report_parts(
+            Check::fail("missing xdotool"),
             Check::ok("ydotool"),
             Check::ok("ydotoold"),
             Check::fail("/tmp/.ydotool_socket: Permission denied"),
