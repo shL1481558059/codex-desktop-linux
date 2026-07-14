@@ -48,6 +48,8 @@ pub struct ScreenshotCapture {
     /// screenshot. A newer capture replaces the cached coordinate mapping.
     pub screenshot_id: String,
     pub mime_type: String,
+    #[serde(skip)]
+    #[schemars(skip)]
     pub data_url: String,
     pub source: String,
     /// Width of the returned image payload.

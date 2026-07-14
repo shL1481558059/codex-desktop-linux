@@ -266,6 +266,7 @@ impl ComputerUseLinux {
     #[tool(
         name = "get_app_state",
         description = "Start an app use session if needed, then get a size-bounded screenshot with a unique screenshot_id plus accessibility state for a Linux app. Use the default PNG on the first call and omit format/quality unless compression is necessary. Tool arguments must be strict JSON; JPEG must be written as the string value \"jpeg\", for example {\"format\":\"jpeg\",\"quality\":70}.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -276,7 +277,7 @@ impl ComputerUseLinux {
     async fn get_app_state(
         &self,
         Parameters(params): Parameters<GetAppStateParams>,
-    ) -> Json<GetAppStateOutput> {
+    ) -> Result<CallToolResult, ErrorData> {
         let verbose = params.verbose.unwrap_or(false);
         let diagnostics = doctor_report();
         let (window_context, window_error, window_permissions_hint) =
@@ -381,21 +382,24 @@ impl ComputerUseLinux {
         {
             message.push_str(" Pass verbose=true for full diagnostics.");
         }
-        Json(GetAppStateOutput {
-            app_name_or_bundle_identifier: params.app_name_or_bundle_identifier,
-            window_context,
-            window_error,
-            window_permissions_hint,
-            backend: "linux-atspi".to_string(),
+        get_app_state_call_result(
+            GetAppStateOutput {
+                app_name_or_bundle_identifier: params.app_name_or_bundle_identifier,
+                window_context,
+                window_error,
+                window_permissions_hint,
+                backend: "linux-atspi".to_string(),
+                screenshot: None,
+                screenshot_error,
+                accessibility_tree,
+                accessibility_tree_raw_count,
+                accessibility_error,
+                readiness,
+                diagnostics: include_full.then_some(diagnostics),
+                message,
+            },
             screenshot,
-            screenshot_error,
-            accessibility_tree,
-            accessibility_tree_raw_count,
-            accessibility_error,
-            readiness,
-            diagnostics: include_full.then_some(diagnostics),
-            message,
-        })
+        )
     }
 
     #[tool(
@@ -2122,6 +2126,30 @@ struct GetAppStateOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<DoctorReport>,
     message: String,
+}
+
+fn get_app_state_call_result(
+    mut output: GetAppStateOutput,
+    screenshot: Option<ScreenshotCapture>,
+) -> Result<CallToolResult, ErrorData> {
+    output.screenshot = screenshot;
+    let image = output.screenshot.as_ref().map(|capture| {
+        Content::image(
+            data_url_payload(&capture.data_url),
+            capture.mime_type.clone(),
+        )
+    });
+    let structured_content = serde_json::to_value(&output).map_err(|error| {
+        ErrorData::internal_error(
+            format!("failed to serialize get_app_state output: {error}"),
+            None,
+        )
+    })?;
+    let mut result = CallToolResult::structured(structured_content);
+    if let Some(image) = image {
+        result.content.insert(0, image);
+    }
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -6193,6 +6221,101 @@ mod tests {
             )
             .unwrap();
         out
+    }
+
+    #[test]
+    fn get_app_state_returns_native_image_without_embedding_it_in_metadata() {
+        let diagnostics = doctor_report();
+        let capture = prepare_screenshot_payload(
+            RawScreenshotCapture {
+                mime_type: "image/png".to_string(),
+                bytes: solid_png(16, 16),
+                source: "test".to_string(),
+                width: 16,
+                height: 16,
+            },
+            ScreenshotPayloadOptions::default(),
+        )
+        .unwrap();
+        let screenshot_id = capture.screenshot_id.clone();
+        let expected_image_data = data_url_payload(&capture.data_url);
+        let output = GetAppStateOutput {
+            app_name_or_bundle_identifier: Some("demo".to_string()),
+            window_context: None,
+            window_error: None,
+            window_permissions_hint: None,
+            backend: "linux-atspi".to_string(),
+            screenshot: None,
+            screenshot_error: None,
+            accessibility_tree: Vec::new(),
+            accessibility_tree_raw_count: 0,
+            accessibility_error: None,
+            readiness: diagnostics.readiness,
+            diagnostics: None,
+            message: "test".to_string(),
+        };
+
+        let mut output_without_screenshot = output.clone();
+        output_without_screenshot.screenshot_error = Some("capture unavailable".to_string());
+        let result_without_screenshot =
+            get_app_state_call_result(output_without_screenshot, None).unwrap();
+        assert_eq!(result_without_screenshot.content.len(), 1);
+        assert!(result_without_screenshot
+            .content
+            .iter()
+            .all(|content| content.raw.as_image().is_none()));
+        let structured_without_screenshot = result_without_screenshot
+            .structured_content
+            .as_ref()
+            .unwrap();
+        assert!(structured_without_screenshot["screenshot"].is_null());
+        assert_eq!(
+            structured_without_screenshot["screenshot_error"],
+            "capture unavailable"
+        );
+
+        let result = get_app_state_call_result(output, Some(capture)).unwrap();
+        let images = result
+            .content
+            .iter()
+            .filter_map(|content| content.raw.as_image())
+            .collect::<Vec<_>>();
+        let texts = result
+            .content
+            .iter()
+            .filter_map(|content| content.raw.as_text())
+            .collect::<Vec<_>>();
+        let structured = result.structured_content.as_ref().unwrap();
+        let structured_json = structured.to_string();
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, expected_image_data);
+        assert_eq!(texts.len(), 1);
+        let text_json: serde_json::Value = serde_json::from_str(&texts[0].text).unwrap();
+        assert_eq!(&text_json, structured);
+        assert!(!texts[0].text.contains("data:image"));
+        assert!(!texts[0].text.contains("data_url"));
+        assert!(!structured_json.contains("data:image"));
+        assert!(!structured_json.contains("data_url"));
+        assert!(!structured_json.contains(&expected_image_data));
+        assert_eq!(structured["screenshot"]["screenshot_id"], screenshot_id);
+        assert_eq!(structured["screenshot"]["width"], 16);
+        assert_eq!(structured["screenshot"]["coordinate_width"], 16);
+        assert_eq!(structured["screenshot"]["coordinate_origin_x"], 0);
+        assert!(structured.get("readiness").is_some());
+        assert!(structured.get("accessibility_tree").is_some());
+        assert!(structured_json.len() < 128 * 1024);
+
+        let tools = ComputerUseLinux::tool_router().list_all();
+        let get_app_state_tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "get_app_state")
+            .unwrap();
+        let output_schema_json =
+            serde_json::to_string(get_app_state_tool.output_schema.as_ref().unwrap()).unwrap();
+        assert!(!output_schema_json.contains("data_url"));
+        assert!(!output_schema_json.contains("dataUrl"));
     }
 
     #[test]
