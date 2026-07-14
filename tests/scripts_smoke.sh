@@ -4739,6 +4739,8 @@ test_launcher_rejects_missing_webview_entrypoint() {
     local home_dir="$workspace/home"
     local runtime_dir="$workspace/runtime"
     local electron_marker="$workspace/electron-called"
+    local notification_bin="$workspace/notification-bin"
+    local notification_marker="$workspace/notification-called"
     local launcher_log="$home_dir/.cache/codex-desktop/launcher.log"
 
     mkdir -p \
@@ -4754,7 +4756,14 @@ test_launcher_rejects_missing_webview_entrypoint() {
         "$app_dir/resources/plugins/openai-bundled/.agents/plugins" \
         "$app_dir/resources/plugins/openai-bundled/plugins" \
         "$home_dir" \
+        "$notification_bin" \
         "$runtime_dir"
+
+    cat > "$notification_bin/notify-send" <<'SCRIPT'
+#!/usr/bin/env bash
+: > "$NOTIFICATION_MARKER"
+SCRIPT
+    chmod +x "$notification_bin/notify-send"
 
     {
         printf '%s\n' \
@@ -4778,13 +4787,15 @@ SCRIPT
 
     set +e
     timeout 20 env -i \
-        PATH="$HOST_TOOL_PATH" \
+        PATH="$notification_bin:$HOST_TOOL_PATH" \
         HOME="$home_dir" \
         XDG_RUNTIME_DIR="$runtime_dir" \
         CODEX_CLI_PATH="$TRUE_BIN" \
+        CODEX_LINUX_DISABLE_DESKTOP_NOTIFICATIONS=1 \
         CODEX_WEBVIEW_PORT=45675 \
         ELECTRON_RENDERER_URL="http://127.0.0.1:9999/" \
         ELECTRON_MARKER="$electron_marker" \
+        NOTIFICATION_MARKER="$notification_marker" \
         "$app_dir/start.sh" >/dev/null 2>&1
     local rc=$?
     set -e
@@ -4792,19 +4803,22 @@ SCRIPT
     [ "$rc" -ne 124 ] || fail "Launcher hung while handling a missing webview entrypoint"
     [ "$rc" -ne 0 ] || fail "Launcher should fail when webview/index.html is missing"
     [ ! -e "$electron_marker" ] || fail "Launcher should not reach Electron when webview/index.html is missing"
+    [ ! -e "$notification_marker" ] || fail "Launcher should suppress desktop notifications when explicitly disabled"
     assert_contains "$launcher_log" "webview bundle is incomplete"
 
     rm -f "$electron_marker"
     set +e
     timeout 20 env -i \
-        PATH="$HOST_TOOL_PATH" \
+        PATH="$notification_bin:$HOST_TOOL_PATH" \
         HOME="$home_dir" \
         XDG_RUNTIME_DIR="$runtime_dir" \
         CODEX_CLI_PATH="$TRUE_BIN" \
+        CODEX_LINUX_DISABLE_DESKTOP_NOTIFICATIONS=1 \
         CODEX_WEBVIEW_PORT=45675 \
         CODEX_LINUX_ALLOW_RENDERER_URL_OVERRIDE=1 \
         ELECTRON_RENDERER_URL="http://127.0.0.1:9999/" \
         ELECTRON_MARKER="$electron_marker" \
+        NOTIFICATION_MARKER="$notification_marker" \
         "$app_dir/start.sh" >/dev/null 2>&1
     rc=$?
     set -e
@@ -4812,6 +4826,7 @@ SCRIPT
     [ "$rc" -ne 124 ] || fail "Launcher hung while using an explicit renderer URL override"
     [ "$rc" -eq 0 ] || fail "Launcher should allow an explicit renderer URL override without local webview assets"
     assert_file_exists "$electron_marker"
+    [ ! -e "$notification_marker" ] || fail "Renderer override should not emit a desktop notification"
     [ "$(cat "$electron_marker")" = "http://127.0.0.1:9999/" ] \
         || fail "Launcher should preserve explicit renderer URL override"
     assert_contains "$launcher_log" "Skipping packaged webview setup because ELECTRON_RENDERER_URL override is enabled"

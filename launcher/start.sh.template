@@ -1776,8 +1776,12 @@ log_codex_cli_path() {
 notify_error() {
     local message="$1"
     local icon
-    icon="$(resolve_notification_icon)"
     echo "$message"
+    if [ "${CODEX_LINUX_DISABLE_DESKTOP_NOTIFICATIONS:-}" = "1" ]; then
+        return 0
+    fi
+
+    icon="$(resolve_notification_icon)"
     if command -v notify-send >/dev/null 2>&1; then
         codex_run_host_command notify-send \
             -a "$CODEX_LINUX_APP_DISPLAY_NAME" \

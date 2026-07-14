@@ -30,13 +30,14 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     env,
     future::Future,
     os::unix::net::{UnixDatagram, UnixStream},
     path::PathBuf,
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -61,7 +62,13 @@ pub struct ComputerUseLinux {
     /// Lazily-created uinput absolute pointer (preferred coordinate backend).
     abs_pointer: Arc<Mutex<Option<crate::abs_pointer::AbsPointer>>>,
     portal_keyboard_init_lock: Arc<tokio::sync::Mutex<()>>,
-    kde_clipboard_lock: Arc<tokio::sync::Mutex<()>>,
+    clipboard_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Persistent X11 clipboard owner. Keeping the arboard handle alive avoids
+    /// losing restored contents on desktops without a clipboard manager.
+    x11_clipboard: Arc<Mutex<Option<arboard::Clipboard>>>,
+    /// Raw multi-target X11 owner used to restore the user's original
+    /// clipboard formats after the temporary paste transaction.
+    x11_raw_clipboard: Arc<Mutex<Option<X11RawClipboard>>>,
     /// Cached logical desktop size (union of monitors) from the most recent
     /// full-frame capture; used for off-screen window/coordinate warnings.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
@@ -73,8 +80,9 @@ pub struct ComputerUseLinux {
     last_atspi_coordinates: Arc<Mutex<Option<AtspiCoordinateMap>>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ScreenshotCoordinateMap {
+    screenshot_id: String,
     image_width: u32,
     image_height: u32,
     coordinate_width: u32,
@@ -257,7 +265,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Use the default PNG on the first call and omit format/quality unless compression is necessary. Tool arguments must be strict JSON; JPEG must be written as the string value \"jpeg\", for example {\"format\":\"jpeg\",\"quality\":70}.",
+        description = "Start an app use session if needed, then get a size-bounded screenshot with a unique screenshot_id plus accessibility state for a Linux app. Use the default PNG on the first call and omit format/quality unless compression is necessary. Tool arguments must be strict JSON; JPEG must be written as the string value \"jpeg\", for example {\"format\":\"jpeg\",\"quality\":70}.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -392,7 +400,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "screenshot",
-        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Use default PNG unless compression is necessary. Tool arguments must be strict JSON; JPEG must be written as the string value \"jpeg\", for example {\"format\":\"jpeg\",\"quality\":70}.",
+        description = "Capture the screen and return it as a viewable, size-bounded image with a unique screenshot_id. Optionally target a window (window_id/pid/wm_class/title/app_id): unless full_screen=true, the window is raised and strictly cropped before resize; target resolution, bounds, or crop failures return an error instead of a full-screen fallback. Use default PNG unless compression is necessary. Tool arguments must be strict JSON; JPEG must be written as the string value \"jpeg\", for example {\"format\":\"jpeg\",\"quality\":70}.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -407,21 +415,62 @@ impl ComputerUseLinux {
         let target = params.window_target();
 
         // When targeting a window, raise it first (so it isn't occluded) and
-        // resolve its bounds so we can crop to just that window.
+        // resolve its bounds so we can crop to just that window. A targeted
+        // capture is strict: failure to identify usable bounds must not turn
+        // into an apparently successful full-desktop screenshot.
         let mut crop: Option<crate::windowing::WindowBounds> = None;
         let mut window_label: Option<String> = None;
         if let Some(target) = &target {
             if params.raise_window.unwrap_or(true) {
-                let _ = focus_window_target(target).await;
+                let focus = focus_window_target(target).await.map_err(|error| {
+                    ErrorData::internal_error(
+                        format!("targeted screenshot could not raise the window: {error:#}"),
+                        None,
+                    )
+                })?;
+                if !focus_satisfies_target(&focus, target) {
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "targeted screenshot could not verify focus for window_id {}",
+                            focus.requested_window.window_id
+                        ),
+                        None,
+                    ));
+                }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             if !params.full_screen.unwrap_or(false) {
-                if let Ok(windows) = list_windows().await {
-                    if let Ok(window) = resolve_window_target(&windows, target) {
-                        crop = window.bounds.clone();
-                        window_label = window.title.clone();
-                    }
+                let windows = list_windows().await.map_err(|error| {
+                    ErrorData::internal_error(
+                        format!("targeted screenshot could not list windows: {error:#}"),
+                        None,
+                    )
+                })?;
+                let window = resolve_window_target(&windows, target).map_err(|error| {
+                    ErrorData::internal_error(
+                        format!("targeted screenshot could not resolve the window: {error:#}"),
+                        None,
+                    )
+                })?;
+                if !window_bounds_match_capture_space(window) {
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "targeted screenshot cannot safely crop window_id {} from backend {:?}: its bounds are not guaranteed to use physical screenshot pixels. Use full_screen=true or a capture-space X11 window backend.",
+                            window.window_id, window.backend
+                        ),
+                        None,
+                    ));
                 }
+                crop = Some(window.bounds.clone().ok_or_else(|| {
+                    ErrorData::internal_error(
+                        format!(
+                            "targeted screenshot window_id {} has no bounds",
+                            window.window_id
+                        ),
+                        None,
+                    )
+                })?);
+                window_label = window.title.clone();
             }
         }
 
@@ -430,29 +479,54 @@ impl ComputerUseLinux {
             .map_err(|e| ErrorData::internal_error(format!("screenshot failed: {e}"), None))?;
         self.cache_desktop_size(raw_capture.width, raw_capture.height);
 
-        // Warn when the target window extends past the visible desktop: the
-        // portal only captures on-screen pixels, so the crop silently loses the
-        // off-screen region while coordinate metadata still claims full size.
+        // Warn when the target window extends past the visible desktop. The
+        // strict crop below returns only the visible intersection and reports
+        // its actual origin and dimensions in the coordinate metadata.
         let off_screen_note = match crop.as_ref() {
             Some(bounds) => self.off_screen_note_for_bounds(bounds).await,
             None => None,
         };
 
-        let (capture, cropped) = match crop.as_ref().and_then(window_crop_rect) {
-            Some((x, y, w, h)) => match crop_png(&raw_capture.bytes, x, y, w, h) {
-                Ok((bytes, cw, ch)) => (
+        let crop_rect = crop
+            .as_ref()
+            .map(|bounds| {
+                window_crop_rect_for_capture(bounds, raw_capture.width, raw_capture.height)
+            })
+            .transpose()
+            .map_err(|error| {
+                ErrorData::internal_error(format!("targeted screenshot crop failed: {error}"), None)
+            })?;
+
+        let (capture, cropped) = match crop_rect {
+            Some(rect) => {
+                let (bytes, width, height) =
+                    crop_image_to_png(&raw_capture.bytes, rect.x, rect.y, rect.width, rect.height)
+                        .map_err(|error| {
+                            ErrorData::internal_error(
+                                format!("targeted screenshot crop failed: {error}"),
+                                None,
+                            )
+                        })?;
+                if width != rect.width || height != rect.height {
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "targeted screenshot crop returned unexpected dimensions {width}x{height}; expected {}x{}",
+                            rect.width, rect.height
+                        ),
+                        None,
+                    ));
+                }
+                (
                     RawScreenshotCapture {
-                        mime_type: raw_capture.mime_type.clone(),
+                        mime_type: "image/png".to_string(),
                         bytes,
                         source: raw_capture.source.clone(),
-                        width: cw,
-                        height: ch,
+                        width,
+                        height,
                     },
                     true,
-                ),
-                // If cropping fails, fall back to the full frame rather than erroring.
-                Err(_) => (raw_capture, false),
-            },
+                )
+            }
             None => (raw_capture, false),
         };
         let mut capture = prepare_screenshot_payload(capture, params.screenshot_options())
@@ -460,14 +534,15 @@ impl ComputerUseLinux {
                 ErrorData::internal_error(format!("screenshot resize failed: {e}"), None)
             })?;
         if cropped {
-            if let Some((x, y, _, _)) = crop.as_ref().and_then(window_crop_rect) {
-                capture.coordinate_origin_x = x.max(0);
-                capture.coordinate_origin_y = y.max(0);
+            if let Some(rect) = crop_rect {
+                capture.coordinate_origin_x = rect.x;
+                capture.coordinate_origin_y = rect.y;
             }
         }
         self.cache_screenshot_coordinates(&capture);
 
         let mut caption = serde_json::json!({
+            "screenshot_id": capture.screenshot_id.clone(),
             "width": capture.width,
             "height": capture.height,
             "coordinate_width": capture.coordinate_width,
@@ -485,7 +560,7 @@ impl ComputerUseLinux {
             "cropped_to_window": cropped,
             "window_title": window_label,
             "coordinate_space": "screenshot",
-            "coordinate_usage": "Pass x/y from this returned image with coordinate_space=screenshot; the backend will convert resize and crop offsets to desktop pixels.",
+            "coordinate_usage": "Pass x/y and screenshot_id from this returned image with coordinate_space=screenshot; the backend rejects missing or stale IDs and converts resize and crop offsets to desktop pixels.",
         });
         if let Some(note) = off_screen_note {
             caption["window_off_screen"] = serde_json::json!(true);
@@ -562,7 +637,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index, semantic selector, or coordinates. For a point chosen from the latest get_app_state/screenshot image, pass coordinate_space=\"screenshot\" so resize and crop offsets are converted automatically; desktop remains the backward-compatible default.",
+        description = "Click an element by index, semantic selector, or coordinates. For a point chosen from a get_app_state/screenshot image, pass coordinate_space=\"screenshot\" plus that image's screenshot_id so resize and crop offsets are converted automatically; missing or stale IDs are rejected. desktop remains the backward-compatible default.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -574,6 +649,9 @@ impl ComputerUseLinux {
         let received = Some(serde_json::json!(params.clone()));
         if params.coordinate_space == CoordinateSpace::Screenshot && params.relative == Some(true) {
             return Json(ActionOutput {
+                dispatched: false,
+                landed: None,
+                verified: false,
                 ok: false,
                 implemented: true,
                 action: "click".to_string(),
@@ -583,10 +661,17 @@ impl ComputerUseLinux {
             });
         }
         let coordinate_space = params.coordinate_space;
-        if let Err(message) =
-            self.translate_explicit_point(&mut params.x, &mut params.y, coordinate_space)
-        {
+        let screenshot_id = params.screenshot_id.clone();
+        if let Err(message) = self.translate_explicit_point(
+            &mut params.x,
+            &mut params.y,
+            coordinate_space,
+            screenshot_id.as_deref(),
+        ) {
             return Json(ActionOutput {
+                dispatched: false,
+                landed: None,
+                verified: false,
                 ok: false,
                 implemented: true,
                 action: "click".to_string(),
@@ -599,6 +684,9 @@ impl ComputerUseLinux {
         let window_target = params.window_target();
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
+                dispatched: false,
+                landed: None,
+                verified: false,
                 ok: false,
                 implemented: true,
                 action: "click".to_string(),
@@ -611,6 +699,9 @@ impl ComputerUseLinux {
                 Ok(focus) => focus,
                 Err(message) => {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "click".to_string(),
@@ -625,6 +716,9 @@ impl ComputerUseLinux {
             if params.relative == Some(true) {
                 let Some(focus) = focus.as_ref() else {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "click".to_string(),
@@ -635,6 +729,9 @@ impl ComputerUseLinux {
                 };
                 if let Err(message) = apply_window_relative_click_coordinates(&mut params, focus) {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "click".to_string(),
@@ -648,6 +745,9 @@ impl ComputerUseLinux {
             Ok(target) => target,
             Err(message) => {
                 return Json(ActionOutput {
+                    dispatched: false,
+                    landed: None,
+                    verified: false,
                     ok: false,
                     implemented: true,
                     action: "click".to_string(),
@@ -674,6 +774,9 @@ impl ComputerUseLinux {
                 match invoke_accessibility_action(&object_ref, Some(&action_index)).await {
                     Ok(invocation) if invocation.ok => {
                         return Json(ActionOutput {
+                            dispatched: true,
+                            landed: Some(true),
+                            verified: true,
                             ok: true,
                             implemented: true,
                             action: "click".to_string(),
@@ -686,6 +789,9 @@ impl ComputerUseLinux {
                     Ok(_) => {
                         let Some(point) = fallback_coordinates else {
                             return Json(ActionOutput {
+                                dispatched: false,
+                                landed: Some(false),
+                                verified: true,
                                 ok: false,
                                 implemented: true,
                                 action: "click".to_string(),
@@ -703,6 +809,9 @@ impl ComputerUseLinux {
                     Err(error) => {
                         let Some(point) = fallback_coordinates else {
                             return Json(ActionOutput {
+                                dispatched: false,
+                                landed: None,
+                                verified: false,
                                 ok: false,
                                 implemented: true,
                                 action: "click".to_string(),
@@ -729,12 +838,12 @@ impl ComputerUseLinux {
         // Off-screen coordinates "succeed" at the uinput layer while landing on
         // no visible pixel — surface that instead of a silent no-op.
         let off_screen_note = self.off_screen_note_for_point(x, y).await;
-        let mut coordinate_notes = Vec::new();
+        let mut coordinate_feedback = ActionFeedback::default();
         if let Some(note) = native_action_fallback_note {
-            coordinate_notes.push(note);
+            coordinate_feedback.notes.push(note);
         }
         if let Some(note) = off_screen_note {
-            coordinate_notes.push(note);
+            coordinate_feedback.merge(ActionFeedback::failed_landing(note));
         }
         if self.should_prefer_xdotool_input_backend() {
             let result = run_xdotool(&xdotool_click_args(
@@ -745,9 +854,9 @@ impl ComputerUseLinux {
             ))
             .await
             .map(|output| vec![output]);
-            return Json(with_notes(
+            return Json(with_action_feedback(
                 action_result_for_backend("click", result, received, "xdotool"),
-                coordinate_notes,
+                coordinate_feedback,
             ));
         }
         if self
@@ -760,15 +869,18 @@ impl ComputerUseLinux {
             .await
             == Some(true)
         {
-            return Json(with_notes(
+            return Json(with_action_feedback(
                 ActionOutput {
+                    dispatched: true,
+                    landed: None,
+                    verified: false,
                     ok: true,
                     implemented: true,
                     action: "click".to_string(),
                     message: "Action sent through the uinput absolute pointer.".to_string(),
                     received,
                 },
-                coordinate_notes.clone(),
+                coordinate_feedback.clone(),
             ));
         }
         if let Some(session) = self.cached_portal_pointer_session() {
@@ -782,15 +894,18 @@ impl ComputerUseLinux {
             .await
             {
                 Ok(()) => {
-                    return Json(with_notes(
+                    return Json(with_action_feedback(
                         ActionOutput {
+                            dispatched: true,
+                            landed: None,
+                            verified: false,
                             ok: true,
                             implemented: true,
                             action: "click".to_string(),
                             message: "Action sent through the remote desktop portal.".to_string(),
                             received,
                         },
-                        coordinate_notes.clone(),
+                        coordinate_feedback.clone(),
                     ));
                 }
                 Err(_) => self.clear_portal_pointer_session(),
@@ -807,8 +922,11 @@ impl ComputerUseLinux {
                 .await
                 {
                     Ok(()) => {
-                        return Json(with_notes(
+                        return Json(with_action_feedback(
                             ActionOutput {
+                                dispatched: true,
+                                landed: None,
+                                verified: false,
                                 ok: true,
                                 implemented: true,
                                 action: "click".to_string(),
@@ -816,7 +934,7 @@ impl ComputerUseLinux {
                                     .to_string(),
                                 received,
                             },
-                            coordinate_notes.clone(),
+                            coordinate_feedback.clone(),
                         ));
                     }
                     Err(_) => self.clear_portal_pointer_session(),
@@ -835,9 +953,9 @@ impl ComputerUseLinux {
             ],
         ])
         .await;
-        Json(with_notes(
+        Json(with_action_feedback(
             action_result("click", result, received),
-            coordinate_notes,
+            coordinate_feedback,
         ))
     }
 
@@ -884,6 +1002,9 @@ impl ComputerUseLinux {
             Ok(object_ref) => object_ref,
             Err(message) => {
                 return Json(ActionOutput {
+                    dispatched: false,
+                    landed: None,
+                    verified: false,
                     ok: false,
                     implemented: true,
                     action: "set_value".to_string(),
@@ -895,6 +1016,9 @@ impl ComputerUseLinux {
 
         match set_element_value(&object_ref, &params.value).await {
             Ok(ValueSetInvocation::Numeric { value }) => Json(ActionOutput {
+                dispatched: true,
+                landed: Some(true),
+                verified: true,
                 ok: true,
                 implemented: true,
                 action: "set_value".to_string(),
@@ -902,6 +1026,9 @@ impl ComputerUseLinux {
                 received,
             }),
             Ok(ValueSetInvocation::EditableText) => Json(ActionOutput {
+                dispatched: true,
+                landed: Some(true),
+                verified: true,
                 ok: true,
                 implemented: true,
                 action: "set_value".to_string(),
@@ -909,6 +1036,9 @@ impl ComputerUseLinux {
                 received,
             }),
             Err(error) => Json(ActionOutput {
+                dispatched: false,
+                landed: None,
+                verified: false,
                 ok: false,
                 implemented: true,
                 action: "set_value".to_string(),
@@ -920,7 +1050,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "scroll",
-        description = "Scroll an element in a direction by a number of pages. For a point chosen from the latest screenshot image, pass coordinate_space=\"screenshot\". With a window target and no x/y/element_index, scrolls at the centre of the targeted window.",
+        description = "Scroll an element in a direction by a number of pages. For a point chosen from a screenshot image, pass coordinate_space=\"screenshot\" plus that image's screenshot_id; missing or stale IDs are rejected. With a window target and no x/y/element_index, scrolls at the centre of the targeted window.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -932,6 +1062,9 @@ impl ComputerUseLinux {
         let received = Some(serde_json::json!(params.clone()));
         if params.coordinate_space == CoordinateSpace::Screenshot && params.relative == Some(true) {
             return Json(ActionOutput {
+                dispatched: false,
+                landed: None,
+                verified: false,
                 ok: false,
                 implemented: true,
                 action: "scroll".to_string(),
@@ -941,10 +1074,17 @@ impl ComputerUseLinux {
             });
         }
         let coordinate_space = params.coordinate_space;
-        if let Err(message) =
-            self.translate_explicit_point(&mut params.x, &mut params.y, coordinate_space)
-        {
+        let screenshot_id = params.screenshot_id.clone();
+        if let Err(message) = self.translate_explicit_point(
+            &mut params.x,
+            &mut params.y,
+            coordinate_space,
+            screenshot_id.as_deref(),
+        ) {
             return Json(ActionOutput {
+                dispatched: false,
+                landed: None,
+                verified: false,
                 ok: false,
                 implemented: true,
                 action: "scroll".to_string(),
@@ -958,6 +1098,9 @@ impl ComputerUseLinux {
         let window_target = params.window_target();
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
+                dispatched: false,
+                landed: None,
+                verified: false,
                 ok: false,
                 implemented: true,
                 action: "scroll".to_string(),
@@ -970,6 +1113,9 @@ impl ComputerUseLinux {
                 Ok(focus) => focus,
                 Err(message) => {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "scroll".to_string(),
@@ -982,6 +1128,9 @@ impl ComputerUseLinux {
             if params.relative == Some(true) {
                 let Some(focus) = focus.as_ref() else {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "scroll".to_string(),
@@ -993,6 +1142,9 @@ impl ComputerUseLinux {
                 };
                 if let Err(message) = apply_window_relative_scroll_coordinates(&mut params, focus) {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "scroll".to_string(),
@@ -1007,6 +1159,9 @@ impl ComputerUseLinux {
                 // Default to the centre of the resolved target window.
                 let Some(focus) = focus.as_ref() else {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "scroll".to_string(),
@@ -1017,6 +1172,9 @@ impl ComputerUseLinux {
                 };
                 if let Err(message) = apply_window_center_scroll_point(&mut params, focus) {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "scroll".to_string(),
@@ -1031,6 +1189,9 @@ impl ComputerUseLinux {
                 Ok(point) => point,
                 Err(message) => {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "scroll".to_string(),
@@ -1046,6 +1207,9 @@ impl ComputerUseLinux {
             "right" => ScrollDirection::Right,
             _ => {
                 return Json(ActionOutput {
+                    dispatched: false,
+                    landed: None,
+                    verified: false,
                     ok: false,
                     implemented: true,
                     action: "scroll".to_string(),
@@ -1059,6 +1223,9 @@ impl ComputerUseLinux {
             Some((x, y)) => self.off_screen_note_for_point(x, y).await,
             None => None,
         };
+        let off_screen_feedback = off_screen_note
+            .map(ActionFeedback::failed_landing)
+            .unwrap_or_default();
 
         if self.should_prefer_xdotool_input_backend() {
             let result = run_xdotool(&xdotool_scroll_args(
@@ -1068,24 +1235,27 @@ impl ComputerUseLinux {
             ))
             .await
             .map(|output| vec![output]);
-            return Json(with_notes(
+            return Json(with_action_feedback(
                 action_result_for_backend("scroll", result, received, "xdotool"),
-                off_screen_note,
+                off_screen_feedback,
             ));
         }
 
         if let Some(session) = self.cached_portal_pointer_session() {
             match portal_scroll(&session, target_point, direction, units).await {
                 Ok(()) => {
-                    return Json(with_notes(
+                    return Json(with_action_feedback(
                         ActionOutput {
+                            dispatched: true,
+                            landed: None,
+                            verified: false,
                             ok: true,
                             implemented: true,
                             action: "scroll".to_string(),
                             message: "Action sent through the remote desktop portal.".to_string(),
                             received,
                         },
-                        off_screen_note.clone(),
+                        off_screen_feedback.clone(),
                     ));
                 }
                 Err(_) => self.clear_portal_pointer_session(),
@@ -1095,8 +1265,11 @@ impl ComputerUseLinux {
                 Ok(Some(session)) => {
                     match portal_scroll(&session, target_point, direction, units).await {
                         Ok(()) => {
-                            return Json(with_notes(
+                            return Json(with_action_feedback(
                                 ActionOutput {
+                                    dispatched: true,
+                                    landed: None,
+                                    verified: false,
                                     ok: true,
                                     implemented: true,
                                     action: "scroll".to_string(),
@@ -1104,7 +1277,7 @@ impl ComputerUseLinux {
                                         .to_string(),
                                     received,
                                 },
-                                off_screen_note.clone(),
+                                off_screen_feedback.clone(),
                             ));
                         }
                         Err(_) => self.clear_portal_pointer_session(),
@@ -1121,6 +1294,9 @@ impl ComputerUseLinux {
             "right" => (-units, 0),
             _ => {
                 return Json(ActionOutput {
+                    dispatched: false,
+                    landed: None,
+                    verified: false,
                     ok: false,
                     implemented: true,
                     action: "scroll".to_string(),
@@ -1136,15 +1312,15 @@ impl ComputerUseLinux {
         }
         sequence.push(wheel_mousemove_args(dx, dy));
         let result = run_ydotool_sequence(&sequence).await;
-        Json(with_notes(
+        Json(with_action_feedback(
             action_result("scroll", result, received),
-            off_screen_note,
+            off_screen_feedback,
         ))
     }
 
     #[tool(
         name = "drag",
-        description = "Drag from one point to another. For points chosen from the latest screenshot image, pass coordinate_space=\"screenshot\" so resize and crop offsets are converted automatically.",
+        description = "Drag from one point to another. For points chosen from a screenshot image, pass coordinate_space=\"screenshot\" plus that image's screenshot_id so resize and crop offsets are converted automatically; missing or stale IDs are rejected.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1155,12 +1331,17 @@ impl ComputerUseLinux {
     async fn drag(&self, Parameters(mut params): Parameters<DragParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         if params.coordinate_space == CoordinateSpace::Screenshot {
-            let start = self.screenshot_point_to_desktop(params.start_x, params.start_y);
-            let end = self.screenshot_point_to_desktop(params.end_x, params.end_y);
+            let screenshot_id = params.screenshot_id.as_deref();
+            let start =
+                self.screenshot_point_to_desktop(params.start_x, params.start_y, screenshot_id);
+            let end = self.screenshot_point_to_desktop(params.end_x, params.end_y, screenshot_id);
             let ((start_x, start_y), (end_x, end_y)) = match (start, end) {
                 (Ok(start), Ok(end)) => (start, end),
                 (Err(message), _) | (_, Err(message)) => {
                     return Json(ActionOutput {
+                        dispatched: false,
+                        landed: None,
+                        verified: false,
                         ok: false,
                         implemented: true,
                         action: "drag".to_string(),
@@ -1174,6 +1355,21 @@ impl ComputerUseLinux {
             params.end_x = end_x;
             params.end_y = end_y;
         }
+        let mut drag_feedback = ActionFeedback::default();
+        if let Some(note) = self
+            .off_screen_note_for_point(params.start_x, params.start_y)
+            .await
+        {
+            drag_feedback.merge(ActionFeedback::failed_landing(format!(
+                "Drag start: {note}"
+            )));
+        }
+        if let Some(note) = self
+            .off_screen_note_for_point(params.end_x, params.end_y)
+            .await
+        {
+            drag_feedback.merge(ActionFeedback::failed_landing(format!("Drag end: {note}")));
+        }
         if self.should_prefer_xdotool_input_backend() {
             let result = run_xdotool(&xdotool_drag_args(
                 params.start_x,
@@ -1183,8 +1379,9 @@ impl ComputerUseLinux {
             ))
             .await
             .map(|output| vec![output]);
-            return Json(action_result_for_backend(
-                "drag", result, received, "xdotool",
+            return Json(with_action_feedback(
+                action_result_for_backend("drag", result, received, "xdotool"),
+                drag_feedback,
             ));
         }
         // After the native X11 xdotool path, prefer the uinput absolute pointer.
@@ -1208,13 +1405,19 @@ impl ComputerUseLinux {
             .ok()
             .flatten();
             if dragged == Some(true) {
-                return Json(ActionOutput {
-                    ok: true,
-                    implemented: true,
-                    action: "drag".to_string(),
-                    message: "Action sent through the uinput absolute pointer.".to_string(),
-                    received,
-                });
+                return Json(with_action_feedback(
+                    ActionOutput {
+                        dispatched: true,
+                        landed: None,
+                        verified: false,
+                        ok: true,
+                        implemented: true,
+                        action: "drag".to_string(),
+                        message: "Action sent through the uinput absolute pointer.".to_string(),
+                        received,
+                    },
+                    drag_feedback.clone(),
+                ));
             }
         }
         if let Some(session) = self.cached_portal_pointer_session() {
@@ -1228,13 +1431,19 @@ impl ComputerUseLinux {
             .await
             {
                 Ok(()) => {
-                    return Json(ActionOutput {
-                        ok: true,
-                        implemented: true,
-                        action: "drag".to_string(),
-                        message: "Action sent through the remote desktop portal.".to_string(),
-                        received,
-                    });
+                    return Json(with_action_feedback(
+                        ActionOutput {
+                            dispatched: true,
+                            landed: None,
+                            verified: false,
+                            ok: true,
+                            implemented: true,
+                            action: "drag".to_string(),
+                            message: "Action sent through the remote desktop portal.".to_string(),
+                            received,
+                        },
+                        drag_feedback.clone(),
+                    ));
                 }
                 Err(_) => self.clear_portal_pointer_session(),
             }
@@ -1250,13 +1459,20 @@ impl ComputerUseLinux {
                 .await
                 {
                     Ok(()) => {
-                        return Json(ActionOutput {
-                            ok: true,
-                            implemented: true,
-                            action: "drag".to_string(),
-                            message: "Action sent through the remote desktop portal.".to_string(),
-                            received,
-                        });
+                        return Json(with_action_feedback(
+                            ActionOutput {
+                                dispatched: true,
+                                landed: None,
+                                verified: false,
+                                ok: true,
+                                implemented: true,
+                                action: "drag".to_string(),
+                                message: "Action sent through the remote desktop portal."
+                                    .to_string(),
+                                received,
+                            },
+                            drag_feedback.clone(),
+                        ));
                     }
                     Err(_) => self.clear_portal_pointer_session(),
                 },
@@ -1271,7 +1487,10 @@ impl ComputerUseLinux {
             vec!["click".to_string(), "0x80".to_string()],
         ])
         .await;
-        Json(action_result("drag", result, received))
+        Json(with_action_feedback(
+            action_result("drag", result, received),
+            drag_feedback,
+        ))
     }
 
     #[tool(
@@ -1293,6 +1512,9 @@ impl ComputerUseLinux {
             Ok(focus) => focus,
             Err(message) => {
                 return Json(ActionOutput {
+                    dispatched: false,
+                    landed: None,
+                    verified: false,
                     ok: false,
                     implemented: true,
                     action: "press_key".to_string(),
@@ -1303,6 +1525,9 @@ impl ComputerUseLinux {
         };
         let Some(key_events) = key_sequence(&params.key) else {
             return Json(ActionOutput {
+                dispatched: false,
+                landed: None,
+                verified: false,
                 ok: false,
                 implemented: true,
                 action: "press_key".to_string(),
@@ -1324,8 +1549,8 @@ impl ComputerUseLinux {
                 "xdotool",
             );
             if output.ok && focus.is_some() {
-                let notes = self.input_landing_notes(focus.as_ref(), false).await;
-                output = with_notes(output, notes);
+                let feedback = self.input_landing_feedback(focus.as_ref(), false).await;
+                output = with_action_feedback(output, feedback);
             }
             return Json(output);
         }
@@ -1334,8 +1559,8 @@ impl ComputerUseLinux {
         let result = run_ydotool(&args).await.map(|output| vec![output]);
         let mut output = action_result_with_focus("press_key", result, received, focus.clone());
         if output.ok && focus.is_some() {
-            let notes = self.input_landing_notes(focus.as_ref(), false).await;
-            output = with_notes(output, notes);
+            let feedback = self.input_landing_feedback(focus.as_ref(), false).await;
+            output = with_action_feedback(output, feedback);
         }
         Json(output)
     }
@@ -1355,10 +1580,14 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        let focus = match self.focus_target_for_input(&params.window_target()).await {
+        let window_target = params.window_target();
+        let focus = match self.focus_target_for_input(&window_target).await {
             Ok(focus) => focus,
             Err(message) => {
                 return Json(ActionOutput {
+                    dispatched: false,
+                    landed: None,
+                    verified: false,
                     ok: false,
                     implemented: true,
                     action: "type_text".to_string(),
@@ -1367,6 +1596,63 @@ impl ComputerUseLinux {
                 });
             }
         };
+        let mut x11_clipboard_fallback_note = None;
+        if self.should_prefer_x11_clipboard_text_backend() {
+            let terminal_target = window_target.has_terminal_target()
+                || focus.as_ref().is_some_and(|focus| {
+                    window_uses_terminal_paste(&focus.requested_window)
+                        || focus
+                            .focused_window
+                            .as_ref()
+                            .is_some_and(window_uses_terminal_paste)
+                });
+            let _clipboard_guard = self.clipboard_lock.lock().await;
+            match run_x11_clipboard_paste_text(
+                &self.x11_clipboard,
+                &self.x11_raw_clipboard,
+                &params.text,
+                terminal_target,
+            )
+            .await
+            {
+                Ok(message) => {
+                    let feedback = self.input_landing_feedback(focus.as_ref(), true).await;
+                    return Json(with_action_feedback(
+                        successful_action_with_focus("type_text", &message, received, focus),
+                        feedback,
+                    ));
+                }
+                Err(error) => {
+                    if !error.can_fallback_to_xdotool {
+                        if error.dispatched {
+                            return Json(with_focus_context(
+                                ActionOutput {
+                                    dispatched: true,
+                                    landed: None,
+                                    verified: false,
+                                    ok: false,
+                                    implemented: true,
+                                    action: "type_text".to_string(),
+                                    message: error.message,
+                                    received,
+                                },
+                                focus,
+                            ));
+                        }
+                        return Json(action_result_with_focus(
+                            "type_text",
+                            Err(error.message),
+                            received,
+                            focus,
+                        ));
+                    }
+                    x11_clipboard_fallback_note = Some(format!(
+                        "X11 clipboard paste was unavailable before Ctrl+V was sent ({}), so the backend used xdotool key-by-key typing.",
+                        first_line(&error.message)
+                    ));
+                }
+            }
+        }
         if self.should_prefer_xdotool_input_backend() {
             let result = run_xdotool(&[
                 "type".to_string(),
@@ -1386,26 +1672,29 @@ impl ComputerUseLinux {
                 "xdotool",
             );
             if output.ok && focus.is_some() {
-                let notes = self.input_landing_notes(focus.as_ref(), true).await;
-                output = with_notes(output, notes);
+                let feedback = self.input_landing_feedback(focus.as_ref(), true).await;
+                output = with_action_feedback(output, feedback);
+            }
+            if let Some(note) = x11_clipboard_fallback_note {
+                output = with_notes(output, [note]);
             }
             return Json(output);
         }
         if self.should_prefer_kde_clipboard_text_backend() {
             match self.ensure_portal_keyboard_session().await {
                 Ok(Some(session)) => {
-                    let _clipboard_guard = self.kde_clipboard_lock.lock().await;
+                    let _clipboard_guard = self.clipboard_lock.lock().await;
                     match run_kde_clipboard_paste_text(&session, &params.text).await {
                         Ok(message) => {
-                            let notes = self.input_landing_notes(focus.as_ref(), true).await;
-                            return Json(with_notes(
+                            let feedback = self.input_landing_feedback(focus.as_ref(), true).await;
+                            return Json(with_action_feedback(
                                 successful_action_with_focus(
                                     "type_text",
                                     &message,
                                     received,
                                     focus,
                                 ),
-                                notes,
+                                feedback,
                             ));
                         }
                         Err(error) => {
@@ -1432,15 +1721,15 @@ impl ComputerUseLinux {
                 match self.ensure_portal_keyboard_session().await {
                     Ok(Some(session)) => match type_text_with_keysyms(&session, &keysyms).await {
                         Ok(()) => {
-                            let notes = self.input_landing_notes(focus.as_ref(), true).await;
-                            return Json(with_notes(
+                            let feedback = self.input_landing_feedback(focus.as_ref(), true).await;
+                            return Json(with_action_feedback(
                                 successful_action_with_focus(
                                     "type_text",
                                     "Action sent through the remote desktop portal.",
                                     received,
                                     focus,
                                 ),
-                                notes,
+                                feedback,
                             ));
                         }
                         Err(error) => {
@@ -1463,8 +1752,8 @@ impl ComputerUseLinux {
             .map(|output| vec![output]);
         let mut output = action_result_with_focus("type_text", result, received, focus.clone());
         if output.ok && focus.is_some() {
-            let notes = self.input_landing_notes(focus.as_ref(), true).await;
-            output = with_notes(output, notes);
+            let feedback = self.input_landing_feedback(focus.as_ref(), true).await;
+            output = with_action_feedback(output, feedback);
         }
         Json(output)
     }
@@ -1527,7 +1816,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.3.1-linux-alpha1",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state with only the needed app/window selectors; keep the first call on the default PNG and omit format/quality. Tool arguments must always be strict JSON. Enum values such as jpeg and png are JSON strings: use {\"format\":\"jpeg\",\"quality\":70}, never a bare value such as {\"format\":jpeg}. If a tool call reports a JSON argument parse error, retry it once with strict JSON instead of ending the task. If diagnostics report disabled accessibility on GNOME, call setup_accessibility before asking the user to retry. If AT-SPI is unavailable on a non-GNOME desktop such as Deepin, do not repeatedly call setup_accessibility; continue with screenshots and coordinate input when readiness confirms an input backend. Use list_windows/focused_window before targeted keyboard input when window introspection is available. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send exact window focus plus pointer/keyboard input through xdotool on X11, send coordinate or element-targeted input through the Wayland remote desktop portal when available, and use ydotool as a fallback. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height, coordinate origin, and scale metadata. For every point selected visually from the latest returned image, pass coordinate_space=\"screenshot\" to click, scroll, or drag so resize and crop offsets are converted automatically; desktop is only for already-physical desktop pixels. Call get_app_state or screenshot immediately before using screenshot coordinates because a later image replaces the cached mapping. Request more detail with max_width, max_height, max_bytes, a strict JSON format string, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. Plain left clicks prefer native AT-SPI actions, and scaled X11 coordinate fallbacks are aligned to the physical target window. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state with only the needed app/window selectors; keep the first call on the default PNG and omit format/quality. Tool arguments must always be strict JSON. Enum values such as jpeg and png are JSON strings: use {\"format\":\"jpeg\",\"quality\":70}, never a bare value such as {\"format\":jpeg}. If a tool call reports a JSON argument parse error, retry it once with strict JSON instead of ending the task. If diagnostics report disabled accessibility on GNOME, call setup_accessibility before asking the user to retry. If AT-SPI is unavailable on a non-GNOME desktop such as Deepin, do not repeatedly call setup_accessibility; continue with screenshots and coordinate input when readiness confirms an input backend. Use list_windows/focused_window before targeted keyboard input when window introspection is available. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send exact window focus plus pointer/keyboard input through xdotool on X11, paste exact X11 text through a verified system-clipboard transaction, send coordinate or element-targeted input through the Wayland remote desktop portal when available, and use ydotool as a fallback. Action results separate dispatched (the backend sent the action), landed (target-level evidence, or null when unknown), and verified (whether the landing conclusion has conclusive post-action evidence); treat landed=false as failure even when dispatched=true. Screenshot results include a unique screenshot_id, width/height for the returned image, coordinate_width/coordinate_height, coordinate origin, and scale metadata. For every point selected visually from a returned image, pass coordinate_space=\"screenshot\" and the screenshot_id from that same image to click, scroll, or drag so resize and crop offsets are converted automatically; missing and stale IDs are rejected, and desktop is only for already-physical desktop pixels. A later image replaces the cached mapping, so coordinates and screenshot_id must always come from the same result. A targeted screenshot without full_screen=true is strict: target resolution, bounds, and crop failures return errors rather than silently returning the whole desktop. Request more detail with max_width, max_height, max_bytes, a strict JSON format string, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. Plain left clicks prefer native AT-SPI actions, and scaled X11 coordinate fallbacks are aligned to the physical target window. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable); a conclusively non-editable target returns landed=false and ok=false instead of reporting a false success. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -1875,10 +2164,14 @@ struct ClickParams {
     relative: Option<bool>,
     /// Coordinate system used by explicit x/y values. `desktop` (default)
     /// accepts physical desktop pixels. `screenshot` accepts pixels from the
-    /// most recently returned get_app_state/screenshot image and converts them
-    /// using its resize and crop metadata.
+    /// a returned get_app_state/screenshot image and converts them using its
+    /// resize and crop metadata. screenshot_id must identify that same image.
     #[serde(default)]
     coordinate_space: CoordinateSpace,
+    /// Opaque ID returned with the screenshot supplying x/y. Required when
+    /// coordinate_space is screenshot and must match the latest capture.
+    #[serde(default)]
+    screenshot_id: Option<String>,
 }
 
 impl ClickParams {
@@ -2003,6 +2296,10 @@ struct ScrollParams {
     /// Coordinate system used by explicit x/y values. See click.
     #[serde(default)]
     coordinate_space: CoordinateSpace,
+    /// Opaque ID returned with the screenshot supplying x/y. Required when
+    /// coordinate_space is screenshot and must match the latest capture.
+    #[serde(default)]
+    screenshot_id: Option<String>,
 }
 
 impl ScrollParams {
@@ -2039,6 +2336,11 @@ struct DragParams {
     /// Coordinate system used by all four points. See click.
     #[serde(default)]
     coordinate_space: CoordinateSpace,
+    /// Opaque ID returned with the screenshot supplying all four points.
+    /// Required when coordinate_space is screenshot and must match the latest
+    /// capture.
+    #[serde(default)]
+    screenshot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -2129,6 +2431,15 @@ impl TypeTextParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct ActionOutput {
+    /// Whether the selected input backend accepted and completed dispatching
+    /// the requested events. This is deliberately separate from target-level
+    /// landing and post-action verification.
+    dispatched: bool,
+    /// Target-level landing evidence. `None` means the desktop could not
+    /// establish whether the dispatched input reached a suitable target.
+    landed: Option<bool>,
+    /// Whether `landed` is backed by a conclusive post-dispatch probe.
+    verified: bool,
     ok: bool,
     implemented: bool,
     action: String,
@@ -2164,6 +2475,14 @@ impl ComputerUseLinux {
                 "COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD",
                 "CODEX_COMPUTER_USE_FORCE_YDOTOOL_KEYBOARD",
             ])
+    }
+
+    fn should_prefer_x11_clipboard_text_backend(&self) -> bool {
+        let forced_ydotool_keyboard = env_flag_enabled_any(&[
+            "COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD",
+            "CODEX_COMPUTER_USE_FORCE_YDOTOOL_KEYBOARD",
+        ]);
+        prefer_x11_clipboard_text_backend(self.is_x11_session(), forced_ydotool_keyboard)
     }
 
     // The Wayland remote-desktop portal is now a *fallback* for input: when a
@@ -2376,6 +2695,7 @@ impl ComputerUseLinux {
 
     fn cache_screenshot_coordinates(&self, capture: &ScreenshotCapture) {
         let mapping = ScreenshotCoordinateMap {
+            screenshot_id: capture.screenshot_id.clone(),
             image_width: capture.width,
             image_height: capture.height,
             coordinate_width: capture.coordinate_width,
@@ -2398,17 +2718,36 @@ impl ComputerUseLinux {
         &self,
         x: i32,
         y: i32,
+        screenshot_id: Option<&str>,
     ) -> std::result::Result<(i32, i32), String> {
+        let mapping = self.screenshot_coordinate_mapping(screenshot_id)?;
+        screenshot_point_to_desktop(&mapping, x, y)
+    }
+
+    fn screenshot_coordinate_mapping(
+        &self,
+        screenshot_id: Option<&str>,
+    ) -> std::result::Result<ScreenshotCoordinateMap, String> {
+        let screenshot_id = screenshot_id.ok_or_else(|| {
+            "screenshot_id is required when coordinate_space=screenshot. Use the ID returned with the screenshot supplying the coordinates."
+                .to_string()
+        })?;
         let mapping = self
             .last_screenshot_coordinates
             .lock()
             .ok()
-            .and_then(|guard| *guard)
+            .and_then(|guard| guard.clone())
             .ok_or_else(|| {
                 "No screenshot coordinate mapping is cached. Call get_app_state or screenshot immediately before using coordinate_space=screenshot."
                     .to_string()
             })?;
-        screenshot_point_to_desktop(mapping, x, y)
+        if screenshot_id != mapping.screenshot_id {
+            return Err(format!(
+                "screenshot_id {screenshot_id:?} does not match the latest screenshot_id {:?}. Call get_app_state or screenshot again and use coordinates plus screenshot_id from the same returned image.",
+                mapping.screenshot_id
+            ));
+        }
+        Ok(mapping)
     }
 
     fn translate_explicit_point(
@@ -2416,16 +2755,21 @@ impl ComputerUseLinux {
         x: &mut Option<i32>,
         y: &mut Option<i32>,
         coordinate_space: CoordinateSpace,
+        screenshot_id: Option<&str>,
     ) -> std::result::Result<(), String> {
         if coordinate_space == CoordinateSpace::Desktop {
             return Ok(());
         }
         let (point_x, point_y) = match (x.as_ref(), y.as_ref()) {
             (Some(point_x), Some(point_y)) => (*point_x, *point_y),
-            (None, None) => return Ok(()),
+            (None, None) => {
+                self.screenshot_coordinate_mapping(screenshot_id)?;
+                return Ok(());
+            }
             _ => return Err("Screenshot coordinate conversion requires both x and y.".to_string()),
         };
-        let (desktop_x, desktop_y) = self.screenshot_point_to_desktop(point_x, point_y)?;
+        let (desktop_x, desktop_y) =
+            self.screenshot_point_to_desktop(point_x, point_y, screenshot_id)?;
         *x = Some(desktop_x);
         *y = Some(desktop_y);
         Ok(())
@@ -2530,24 +2874,28 @@ impl ComputerUseLinux {
         &self,
         focus: Option<&WindowFocusResult>,
         expects_editable: bool,
-    ) -> Option<String> {
-        let focus = focus?;
+    ) -> ActionFeedback {
+        let Some(focus) = focus else {
+            return ActionFeedback::default();
+        };
         let pid = focus
             .focused_window
             .as_ref()
             .and_then(|window| window.pid)
             .or(focus.requested_window.pid);
         match timeout(Duration::from_millis(1500), focused_element_summary(pid)).await {
-            Ok(Ok(Some(element))) => Some(describe_focused_element(&element, expects_editable)),
-            Ok(Ok(None)) => Some(
+            Ok(Ok(Some(element))) => focused_element_assessment(&element, expects_editable),
+            Ok(Ok(None)) => ActionFeedback::unverified(
                 "WARNING: AT-SPI reports no focused element in the target app — the input may have landed nowhere. If this is an Electron app, launch it with --force-renderer-accessibility to expose its UI tree."
                     .to_string(),
             ),
-            Ok(Err(error)) => Some(format!(
+            Ok(Err(error)) => ActionFeedback::unverified(format!(
                 "Focused-element feedback unavailable ({}).",
                 first_line(&format!("{error:#}"))
             )),
-            Err(_) => Some("Focused-element feedback unavailable (AT-SPI probe timed out).".to_string()),
+            Err(_) => ActionFeedback::unverified(
+                "Focused-element feedback unavailable (AT-SPI probe timed out).",
+            ),
         }
     }
 
@@ -2634,12 +2982,12 @@ impl ComputerUseLinux {
 
     /// Notes appended after targeted keyboard input: off-screen window warning
     /// plus focused-element feedback.
-    async fn input_landing_notes(
+    async fn input_landing_feedback(
         &self,
         focus: Option<&WindowFocusResult>,
         expects_editable: bool,
-    ) -> Vec<String> {
-        let mut notes = Vec::new();
+    ) -> ActionFeedback {
+        let mut feedback = ActionFeedback::default();
         if let Some(focus) = focus {
             let bounds = focus
                 .focused_window
@@ -2648,14 +2996,12 @@ impl ComputerUseLinux {
                 .or(focus.requested_window.bounds.as_ref());
             if let Some(bounds) = bounds {
                 if let Some(note) = self.off_screen_note_for_bounds(bounds).await {
-                    notes.push(note);
+                    feedback.notes.push(note);
                 }
             }
         }
-        if let Some(note) = self.focused_element_feedback(focus, expects_editable).await {
-            notes.push(note);
-        }
-        notes
+        feedback.merge(self.focused_element_feedback(focus, expects_editable).await);
+        feedback
     }
 
     fn cache_nodes(&self, nodes: &[AccessibilityNode]) {
@@ -2835,6 +3181,9 @@ impl ComputerUseLinux {
             Ok(object_ref) => object_ref,
             Err(message) => {
                 return Json(ActionOutput {
+                    dispatched: false,
+                    landed: None,
+                    verified: false,
                     ok: false,
                     implemented: true,
                     action: "perform_action".to_string(),
@@ -2846,6 +3195,9 @@ impl ComputerUseLinux {
 
         match invoke_accessibility_action(&object_ref, requested_action).await {
             Ok(invocation) => Json(ActionOutput {
+                dispatched: invocation.ok,
+                landed: Some(invocation.ok),
+                verified: true,
                 ok: invocation.ok,
                 implemented: true,
                 action: "perform_action".to_string(),
@@ -2873,6 +3225,9 @@ impl ComputerUseLinux {
                 received,
             }),
             Err(error) => Json(ActionOutput {
+                dispatched: false,
+                landed: None,
+                verified: false,
                 ok: false,
                 implemented: true,
                 action: "perform_action".to_string(),
@@ -3127,7 +3482,7 @@ fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
 }
 
 fn screenshot_point_to_desktop(
-    mapping: ScreenshotCoordinateMap,
+    mapping: &ScreenshotCoordinateMap,
     x: i32,
     y: i32,
 ) -> std::result::Result<(i32, i32), String> {
@@ -3436,15 +3791,71 @@ fn data_url_payload(data_url: &str) -> String {
         .to_string()
 }
 
-/// Convert a window's bounds into a crop rectangle, if it has a usable origin
-/// and non-zero size.
-fn window_crop_rect(bounds: &crate::windowing::WindowBounds) -> Option<(i32, i32, u32, u32)> {
-    let x = bounds.x?;
-    let y = bounds.y?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowCropRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn window_bounds_match_capture_space(window: &WindowInfo) -> bool {
+    matches!(
+        window.backend.as_str(),
+        crate::windowing::XDOTOOL_BACKEND | crate::windowing::I3_BACKEND
+    )
+}
+
+/// Intersect window bounds with the pixels present in a full-desktop capture.
+/// The returned origin is both the PNG crop origin and the physical desktop
+/// origin represented by pixel (0, 0) in the cropped result. Raw captures do
+/// not currently expose a virtual-desktop origin, so their pixel canvas is
+/// defined as `[0, width) x [0, height)`; backends with a non-zero canvas
+/// origin must add that metadata before their negative global coordinates can
+/// be translated rather than clipped.
+fn window_crop_rect_for_capture(
+    bounds: &crate::windowing::WindowBounds,
+    capture_width: u32,
+    capture_height: u32,
+) -> std::result::Result<WindowCropRect, String> {
+    let x = bounds
+        .x
+        .ok_or_else(|| "target window bounds have no x origin".to_string())?;
+    let y = bounds
+        .y
+        .ok_or_else(|| "target window bounds have no y origin".to_string())?;
     if bounds.width == 0 || bounds.height == 0 {
-        return None;
+        return Err("target window bounds must be non-empty".to_string());
     }
-    Some((x, y, bounds.width, bounds.height))
+    if capture_width == 0 || capture_height == 0 {
+        return Err("desktop screenshot has invalid zero-sized bounds".to_string());
+    }
+
+    let left = i64::from(x);
+    let top = i64::from(y);
+    let right = left + i64::from(bounds.width);
+    let bottom = top + i64::from(bounds.height);
+    let visible_left = left.max(0);
+    let visible_top = top.max(0);
+    let visible_right = right.min(i64::from(capture_width));
+    let visible_bottom = bottom.min(i64::from(capture_height));
+    if visible_left >= visible_right || visible_top >= visible_bottom {
+        return Err(format!(
+            "target window bounds ({x},{y} {}x{}) are completely outside the desktop screenshot ({}x{})",
+            bounds.width, bounds.height, capture_width, capture_height
+        ));
+    }
+
+    Ok(WindowCropRect {
+        x: i32::try_from(visible_left)
+            .map_err(|_| "visible crop x origin exceeds desktop coordinates".to_string())?,
+        y: i32::try_from(visible_top)
+            .map_err(|_| "visible crop y origin exceeds desktop coordinates".to_string())?,
+        width: u32::try_from(visible_right - visible_left)
+            .map_err(|_| "visible crop width exceeds screenshot coordinates".to_string())?,
+        height: u32::try_from(visible_bottom - visible_top)
+            .map_err(|_| "visible crop height exceeds screenshot coordinates".to_string())?,
+    })
 }
 
 fn apply_window_relative_click_coordinates(
@@ -3555,9 +3966,10 @@ fn apply_window_relative_scroll_coordinates(
     Ok(())
 }
 
-/// Crop a PNG image to `(x, y, w, h)` (clamped to the image), returning the
-/// re-encoded PNG and the actual cropped dimensions.
-fn crop_png(
+/// Crop any supported screenshot image to an already-validated rectangle,
+/// returning a normalized PNG and cropped dimensions. Invalid or out-of-range
+/// rectangles are rejected instead of being silently clamped.
+fn crop_image_to_png(
     raw: &[u8],
     x: i32,
     y: i32,
@@ -3565,16 +3977,24 @@ fn crop_png(
     h: u32,
 ) -> std::result::Result<(Vec<u8>, u32, u32), String> {
     use std::io::Cursor;
-    let img = image::load_from_memory_with_format(raw, image::ImageFormat::Png)
-        .map_err(|e| format!("decode png: {e}"))?;
+    let img = image::load_from_memory(raw).map_err(|e| format!("decode screenshot image: {e}"))?;
     let (iw, ih) = (img.width(), img.height());
-    let x = x.max(0) as u32;
-    let y = y.max(0) as u32;
-    if x >= iw || y >= ih {
-        return Err("crop origin outside image".into());
+    if x < 0 || y < 0 || w == 0 || h == 0 {
+        return Err("crop rectangle must have a non-negative origin and non-zero size".into());
     }
-    let w = w.min(iw - x);
-    let h = h.min(ih - y);
+    let x = x as u32;
+    let y = y as u32;
+    let right = x
+        .checked_add(w)
+        .ok_or_else(|| "crop rectangle x range overflowed".to_string())?;
+    let bottom = y
+        .checked_add(h)
+        .ok_or_else(|| "crop rectangle y range overflowed".to_string())?;
+    if x >= iw || y >= ih || right > iw || bottom > ih {
+        return Err(format!(
+            "crop rectangle ({x},{y} {w}x{h}) is outside image ({iw}x{ih})"
+        ));
+    }
     let sub = img.crop_imm(x, y, w, h);
     let mut out = Vec::new();
     sub.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
@@ -3598,6 +4018,9 @@ fn action_result_for_backend(
 ) -> ActionOutput {
     match result {
         Ok(_) => ActionOutput {
+            dispatched: true,
+            landed: None,
+            verified: false,
             ok: true,
             implemented: true,
             action: action.to_string(),
@@ -3605,6 +4028,9 @@ fn action_result_for_backend(
             received,
         },
         Err(message) => ActionOutput {
+            dispatched: false,
+            landed: None,
+            verified: false,
             ok: false,
             implemented: true,
             action: action.to_string(),
@@ -3644,6 +4070,9 @@ fn successful_action_with_focus(
 ) -> ActionOutput {
     with_focus_context(
         ActionOutput {
+            dispatched: true,
+            landed: None,
+            verified: false,
             ok: true,
             implemented: true,
             action: action.to_string(),
@@ -3655,7 +4084,7 @@ fn successful_action_with_focus(
 }
 
 fn with_focus_context(mut output: ActionOutput, focus: Option<WindowFocusResult>) -> ActionOutput {
-    if output.ok {
+    if output.dispatched {
         if let Some(focus) = focus {
             let verification = if focus.exact_window_focused {
                 "exact window-focus"
@@ -3669,6 +4098,55 @@ fn with_focus_context(mut output: ActionOutput, focus: Option<WindowFocusResult>
         }
     }
     output
+}
+
+#[derive(Debug, Clone, Default)]
+struct ActionFeedback {
+    notes: Vec<String>,
+    landed: Option<bool>,
+    verified: bool,
+}
+
+impl ActionFeedback {
+    fn unverified(note: impl Into<String>) -> Self {
+        Self {
+            notes: vec![note.into()],
+            landed: None,
+            verified: false,
+        }
+    }
+
+    fn failed_landing(note: impl Into<String>) -> Self {
+        Self {
+            notes: vec![note.into()],
+            landed: Some(false),
+            verified: true,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.notes.extend(other.notes);
+        if other.landed.is_some() {
+            self.landed = other.landed;
+        }
+        self.verified |= other.verified;
+    }
+}
+
+fn focused_element_assessment(
+    element: &FocusedElementSummary,
+    expects_editable: bool,
+) -> ActionFeedback {
+    let note = describe_focused_element(element, expects_editable);
+    if expects_editable && !element.editable {
+        ActionFeedback {
+            notes: vec![note],
+            landed: Some(false),
+            verified: true,
+        }
+    } else {
+        ActionFeedback::unverified(note)
+    }
 }
 
 fn describe_focused_element(element: &FocusedElementSummary, expects_editable: bool) -> String {
@@ -3699,6 +4177,20 @@ fn first_line(text: &str) -> &str {
 fn with_notes(mut output: ActionOutput, notes: impl IntoIterator<Item = String>) -> ActionOutput {
     for note in notes {
         output.message = format!("{} {note}", output.message);
+    }
+    output
+}
+
+/// Apply target-level post-dispatch evidence. A conclusively wrong landing is
+/// a failed action even though the backend successfully sent its events.
+fn with_action_feedback(mut output: ActionOutput, feedback: ActionFeedback) -> ActionOutput {
+    output = with_notes(output, feedback.notes);
+    if output.dispatched {
+        output.landed = feedback.landed;
+        output.verified = feedback.verified;
+        if output.landed == Some(false) {
+            output.ok = false;
+        }
     }
     output
 }
@@ -3969,6 +4461,1206 @@ where
 fn ydotool_type_timeout(text: &str) -> Duration {
     let text_seconds = (text.chars().count() as u64).div_ceil(YDOTOOL_TYPE_CHARS_PER_SECOND);
     Duration::from_secs(YDOTOOL_TIMEOUT.as_secs().saturating_add(text_seconds))
+}
+
+fn prefer_x11_clipboard_text_backend(is_x11: bool, forced_ydotool_keyboard: bool) -> bool {
+    is_x11 && !forced_ydotool_keyboard
+}
+
+fn clipboard_write_was_verified(expected: &str, actual: &str) -> bool {
+    expected == actual
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardRestoreDecision {
+    RestorePrevious,
+    PreserveCurrent,
+    Unreadable,
+}
+
+fn clipboard_restore_decision(
+    temporary_owner: u32,
+    current_owner: std::result::Result<u32, ()>,
+) -> ClipboardRestoreDecision {
+    match current_owner {
+        Ok(current_owner) if current_owner == temporary_owner => {
+            ClipboardRestoreDecision::RestorePrevious
+        }
+        Ok(_) => ClipboardRestoreDecision::PreserveCurrent,
+        Err(_) => ClipboardRestoreDecision::Unreadable,
+    }
+}
+
+fn clipboard_restore_decision_for_known_owner(
+    temporary_owner: Option<u32>,
+    current_owner: std::result::Result<u32, ()>,
+) -> ClipboardRestoreDecision {
+    match temporary_owner {
+        Some(temporary_owner) => clipboard_restore_decision(temporary_owner, current_owner),
+        None => match current_owner {
+            Ok(_) => ClipboardRestoreDecision::PreserveCurrent,
+            Err(()) => ClipboardRestoreDecision::Unreadable,
+        },
+    }
+}
+
+const X11_CLIPBOARD_MAX_TARGETS: usize = 256;
+const X11_CLIPBOARD_MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const X11_CLIPBOARD_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn x11_clipboard_get_property_long_length(max_bytes: usize) -> u32 {
+    let bounded_bytes = max_bytes.min(X11_CLIPBOARD_MAX_SNAPSHOT_BYTES);
+    u32::try_from(bounded_bytes.div_ceil(4))
+        .expect("the X11 clipboard snapshot byte limit always fits in u32 words")
+}
+
+fn x11_clipboard_snapshot_target_limit(
+    accumulated_bytes: usize,
+    owner_inline_limit: usize,
+) -> std::result::Result<usize, String> {
+    let remaining = X11_CLIPBOARD_MAX_SNAPSHOT_BYTES
+        .checked_sub(accumulated_bytes)
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| {
+            format!(
+                "X11 clipboard snapshot reached its aggregate limit of {X11_CLIPBOARD_MAX_SNAPSHOT_BYTES} bytes"
+            )
+        })?;
+    let target_limit = remaining.min(owner_inline_limit);
+    if target_limit == 0 {
+        return Err("X11 clipboard owner has no safe inline restore capacity".to_string());
+    }
+    Ok(target_limit)
+}
+
+#[derive(Debug)]
+enum X11ClipboardSnapshot {
+    Empty,
+    Raw(Vec<X11RawClipboardTarget>),
+}
+
+#[derive(Debug, Clone)]
+struct X11RawClipboardTarget {
+    name: String,
+    atom: u32,
+    property: X11ClipboardProperty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X11ClipboardProperty {
+    type_atom: u32,
+    format: u8,
+    bytes: Vec<u8>,
+}
+
+fn x11_clipboard_property_from_reply_parts(
+    requested_target: u32,
+    type_atom: u32,
+    format: u8,
+    bytes: Vec<u8>,
+) -> std::result::Result<X11ClipboardProperty, String> {
+    if type_atom == x11rb::NONE {
+        return Err(format!(
+            "X11 clipboard target atom {requested_target} returned no property type"
+        ));
+    }
+    x11_clipboard_property_item_count(format, bytes.len())?;
+    Ok(X11ClipboardProperty {
+        type_atom,
+        format,
+        bytes,
+    })
+}
+
+fn x11_clipboard_property_item_count(
+    format: u8,
+    byte_len: usize,
+) -> std::result::Result<u32, String> {
+    let bytes_per_item = match format {
+        8 => 1,
+        16 => 2,
+        32 => 4,
+        _ => {
+            return Err(format!(
+                "X11 clipboard property uses unsupported format {format}"
+            ));
+        }
+    };
+    if !byte_len.is_multiple_of(bytes_per_item) {
+        return Err(format!(
+            "X11 clipboard property has {byte_len} bytes, which is not aligned to format {format}"
+        ));
+    }
+    u32::try_from(byte_len / bytes_per_item)
+        .map_err(|_| "X11 clipboard property contains too many items".to_string())
+}
+
+fn load_x11_clipboard_property(
+    context: &x11_clipboard::Context,
+    selection: u32,
+    requested_target: u32,
+    property: u32,
+    deadline: Instant,
+    max_inline_bytes: usize,
+) -> std::result::Result<X11ClipboardProperty, String> {
+    use x11rb::{
+        connection::Connection,
+        protocol::{
+            xproto::{AtomEnum, ConnectionExt, Property},
+            Event,
+        },
+    };
+
+    let result = (|| {
+        if Instant::now() >= deadline {
+            return Err("X11 clipboard snapshot exceeded its total deadline".to_string());
+        }
+        let property_long_length = x11_clipboard_get_property_long_length(max_inline_bytes);
+        context
+            .connection
+            .delete_property(context.window, property)
+            .map_err(|error| format!("failed to clear the X11 clipboard property: {error}"))?
+            .check()
+            .map_err(|error| format!("X11 rejected clipboard property cleanup: {error}"))?;
+        context
+            .connection
+            .convert_selection(
+                context.window,
+                selection,
+                requested_target,
+                property,
+                x11rb::CURRENT_TIME,
+            )
+            .map_err(|error| format!("failed to request X11 clipboard conversion: {error}"))?
+            .check()
+            .map_err(|error| format!("X11 rejected clipboard conversion: {error}"))?;
+        context
+            .connection
+            .flush()
+            .map_err(|error| format!("failed to flush X11 clipboard conversion: {error}"))?;
+
+        let mut incremental_transfer = false;
+        let mut incremental: Option<X11ClipboardProperty> = None;
+        let mut incremental_error: Option<String> = None;
+        loop {
+            if Instant::now() >= deadline {
+                return Err("X11 clipboard conversion timed out".to_string());
+            }
+            let event = match context.connection.poll_for_event().map_err(|error| {
+                format!("failed while waiting for X11 clipboard conversion: {error}")
+            })? {
+                Some(event) => event,
+                None => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+            };
+
+            match event {
+                Event::SelectionNotify(event)
+                    if event.requestor == context.window
+                        && event.selection == selection
+                        && event.target == requested_target =>
+                {
+                    if event.property == x11rb::NONE {
+                        return Err(
+                            "the X11 clipboard owner could not convert the target".to_string()
+                        );
+                    }
+                    let reply = context
+                        .connection
+                        .get_property(
+                            false,
+                            context.window,
+                            event.property,
+                            AtomEnum::ANY,
+                            0,
+                            property_long_length,
+                        )
+                        .map_err(|error| {
+                            format!("failed to read the converted X11 clipboard property: {error}")
+                        })?
+                        .reply()
+                        .map_err(|error| {
+                            format!(
+                                "failed to receive the converted X11 clipboard property: {error}"
+                            )
+                        })?;
+                    if reply.type_ == context.atoms.incr {
+                        incremental_error = if reply.bytes_after != 0 {
+                            Some(format!(
+                                "X11 INCR clipboard header still has {} unread bytes",
+                                reply.bytes_after
+                            ))
+                        } else {
+                            match reply.value32().and_then(|mut values| values.next()) {
+                                Some(lower_bound) if lower_bound as usize > max_inline_bytes => {
+                                    Some(format!(
+                                        "X11 clipboard target is at least {lower_bound} bytes, exceeding the safe inline restore limit of {max_inline_bytes} bytes"
+                                    ))
+                                }
+                                Some(_) => None,
+                                None => Some(format!(
+                                    "X11 INCR clipboard header uses invalid format {} or contains no size lower bound",
+                                    reply.format
+                                )),
+                            }
+                        };
+                        context
+                            .connection
+                            .delete_property(context.window, property)
+                            .map_err(|error| {
+                                format!(
+                                    "failed to acknowledge X11 INCR clipboard transfer: {error}"
+                                )
+                            })?
+                            .check()
+                            .map_err(|error| {
+                                format!("X11 rejected INCR clipboard acknowledgement: {error}")
+                            })?;
+                        context.connection.flush().map_err(|error| {
+                            format!("failed to flush X11 INCR clipboard acknowledgement: {error}")
+                        })?;
+                        incremental_transfer = true;
+                        incremental = None;
+                        continue;
+                    }
+                    if reply.bytes_after != 0 {
+                        return Err(format!(
+                            "converted X11 clipboard property still has {} unread bytes",
+                            reply.bytes_after
+                        ));
+                    }
+                    if reply.value.len() > max_inline_bytes {
+                        return Err(format!(
+                            "X11 clipboard target is {} bytes, exceeding the safe inline restore limit of {} bytes",
+                            reply.value.len(), max_inline_bytes
+                        ));
+                    }
+                    return x11_clipboard_property_from_reply_parts(
+                        requested_target,
+                        reply.type_,
+                        reply.format,
+                        reply.value,
+                    );
+                }
+                Event::PropertyNotify(event)
+                    if incremental_transfer
+                        && event.window == context.window
+                        && event.atom == property
+                        && event.state == Property::NEW_VALUE =>
+                {
+                    let reply = context
+                        .connection
+                        .get_property(
+                            true,
+                            context.window,
+                            property,
+                            AtomEnum::ANY,
+                            0,
+                            property_long_length,
+                        )
+                        .map_err(|error| {
+                            format!("failed to read an X11 INCR clipboard chunk: {error}")
+                        })?
+                        .reply()
+                        .map_err(|error| {
+                            format!("failed to receive an X11 INCR clipboard chunk: {error}")
+                        })?;
+                    if reply.bytes_after != 0 {
+                        incremental_error.get_or_insert_with(|| {
+                            format!(
+                                "X11 INCR clipboard chunk still has {} unread bytes",
+                                reply.bytes_after
+                            )
+                        });
+                        context
+                            .connection
+                            .delete_property(context.window, property)
+                            .map_err(|error| {
+                                format!("failed to discard an invalid X11 INCR chunk: {error}")
+                            })?
+                            .check()
+                            .map_err(|error| {
+                                format!("X11 rejected invalid INCR chunk cleanup: {error}")
+                            })?;
+                        incremental = None;
+                        continue;
+                    }
+                    if reply.value.is_empty() {
+                        if let Some(error) = incremental_error.take() {
+                            return Err(error);
+                        }
+                        let terminator = x11_clipboard_property_from_reply_parts(
+                            requested_target,
+                            reply.type_,
+                            reply.format,
+                            reply.value,
+                        )?;
+                        return match incremental.take() {
+                            Some(value)
+                                if value.type_atom != terminator.type_atom
+                                    || value.format != terminator.format =>
+                            {
+                                Err(
+                                    "X11 INCR clipboard terminator changed property type or format"
+                                        .to_string(),
+                                )
+                            }
+                            Some(value) => Ok(value),
+                            None => Ok(terminator),
+                        };
+                    }
+                    if incremental_error.is_some() {
+                        continue;
+                    }
+                    let chunk = match x11_clipboard_property_from_reply_parts(
+                        requested_target,
+                        reply.type_,
+                        reply.format,
+                        reply.value,
+                    ) {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            incremental_error = Some(error);
+                            incremental = None;
+                            continue;
+                        }
+                    };
+                    if chunk.bytes.len() > max_inline_bytes {
+                        incremental_error = Some(format!(
+                            "X11 clipboard target exceeds the safe inline restore limit of {max_inline_bytes} bytes"
+                        ));
+                        incremental = None;
+                        continue;
+                    }
+                    if let Some(value) = incremental.as_mut() {
+                        if value.type_atom != chunk.type_atom || value.format != chunk.format {
+                            incremental_error = Some(
+                                "X11 INCR clipboard chunks changed property type or format"
+                                    .to_string(),
+                            );
+                            incremental = None;
+                            continue;
+                        }
+                        if value.bytes.len().saturating_add(chunk.bytes.len()) > max_inline_bytes {
+                            incremental_error = Some(format!(
+                                "X11 clipboard target exceeds the safe inline restore limit of {max_inline_bytes} bytes"
+                            ));
+                            incremental = None;
+                            continue;
+                        }
+                        value.bytes.extend_from_slice(&chunk.bytes);
+                    } else {
+                        incremental = Some(chunk);
+                    }
+                }
+                _ => {}
+            }
+        }
+    })();
+
+    let cleanup = context
+        .connection
+        .delete_property(context.window, property)
+        .map_err(|error| error.to_string())
+        .and_then(|cookie| cookie.check().map_err(|error| error.to_string()));
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(format!(
+            "failed to clean up the X11 clipboard property: {error}"
+        )),
+        (Err(error), _) => Err(error),
+    }
+}
+
+struct X11RawClipboard {
+    loader: x11_clipboard::Clipboard,
+    owner: X11MultiTargetOwner,
+}
+
+struct X11MultiTargetOwner {
+    context: Arc<x11_clipboard::Context>,
+    data: Arc<RwLock<HashMap<u32, X11ClipboardProperty>>>,
+    max_inline_bytes: usize,
+}
+
+impl X11RawClipboard {
+    fn new() -> std::result::Result<Self, String> {
+        Ok(Self {
+            loader: x11_clipboard::Clipboard::new().map_err(|error| {
+                format!("failed to initialize raw X11 clipboard loader: {error}")
+            })?,
+            owner: X11MultiTargetOwner::new()?,
+        })
+    }
+
+    fn snapshot_targets(
+        &self,
+        target_names: &[String],
+        deadline: Instant,
+    ) -> std::result::Result<Vec<X11RawClipboardTarget>, String> {
+        if target_names.len() > X11_CLIPBOARD_MAX_TARGETS {
+            return Err(format!(
+                "X11 clipboard advertised {} targets, exceeding the limit of {X11_CLIPBOARD_MAX_TARGETS}",
+                target_names.len()
+            ));
+        }
+        let mut targets = Vec::new();
+        let mut accumulated_bytes = 0usize;
+        for name in target_names {
+            if x11_clipboard_target_is_protocol(name) {
+                continue;
+            }
+            if Instant::now() >= deadline {
+                return Err("X11 clipboard snapshot exceeded its total deadline".to_string());
+            }
+            let atom = self.loader.getter.get_atom(name).map_err(|error| {
+                format!("failed to resolve X11 clipboard target {name:?}: {error}")
+            })?;
+            let target_limit = x11_clipboard_snapshot_target_limit(
+                accumulated_bytes,
+                self.owner.max_inline_bytes,
+            )?;
+            let property = load_x11_clipboard_property(
+                &self.loader.getter,
+                self.loader.getter.atoms.clipboard,
+                atom,
+                self.loader.getter.atoms.property,
+                deadline,
+                target_limit,
+            )
+            .map_err(|error| {
+                format!("failed to snapshot X11 clipboard target {name:?}: {error}")
+            })?;
+            accumulated_bytes = accumulated_bytes
+                .checked_add(property.bytes.len())
+                .filter(|total| *total <= X11_CLIPBOARD_MAX_SNAPSHOT_BYTES)
+                .ok_or_else(|| {
+                    format!(
+                        "X11 clipboard snapshot exceeded its aggregate limit of {X11_CLIPBOARD_MAX_SNAPSHOT_BYTES} bytes"
+                    )
+                })?;
+            targets.push(X11RawClipboardTarget {
+                name: name.clone(),
+                atom,
+                property,
+            });
+        }
+        Ok(targets)
+    }
+}
+
+impl X11MultiTargetOwner {
+    fn new() -> std::result::Result<Self, String> {
+        use x11rb::connection::RequestConnection;
+
+        let context =
+            Arc::new(x11_clipboard::Context::new(None).map_err(|error| {
+                format!("failed to initialize raw X11 clipboard owner: {error}")
+            })?);
+        let data = Arc::new(RwLock::new(HashMap::new()));
+        let max_inline_bytes = context
+            .connection
+            .maximum_request_bytes()
+            .saturating_sub(64);
+        let thread_context = Arc::clone(&context);
+        let thread_data = Arc::clone(&data);
+        std::thread::spawn(move || serve_x11_multi_target_clipboard(thread_context, thread_data));
+        Ok(Self {
+            context,
+            data,
+            max_inline_bytes,
+        })
+    }
+
+    fn set_targets(&self, targets: &[X11RawClipboardTarget]) -> std::result::Result<u32, String> {
+        use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
+
+        let mut data = self
+            .data
+            .write()
+            .map_err(|_| "raw X11 clipboard data lock was poisoned".to_string())?;
+        data.clear();
+        for target in targets {
+            if target.property.bytes.len() > self.max_inline_bytes {
+                return Err(format!(
+                    "X11 clipboard target {:?} exceeds the safe inline restore limit",
+                    target.name
+                ));
+            }
+            data.insert(target.atom, target.property.clone());
+        }
+        drop(data);
+        self.context
+            .connection
+            .set_selection_owner(
+                self.context.window,
+                self.context.atoms.clipboard,
+                x11rb::CURRENT_TIME,
+            )
+            .map_err(|error| format!("failed to restore X11 clipboard ownership: {error}"))?
+            .check()
+            .map_err(|error| format!("X11 rejected restored clipboard ownership: {error}"))?;
+        self.context.connection.flush().map_err(|error| {
+            format!("failed to flush restored X11 clipboard ownership: {error}")
+        })?;
+        let owner = self
+            .context
+            .connection
+            .get_selection_owner(self.context.atoms.clipboard)
+            .map_err(|error| format!("failed to verify restored X11 clipboard owner: {error}"))?
+            .reply()
+            .map_err(|error| format!("failed to read restored X11 clipboard owner: {error}"))?
+            .owner;
+        if owner == self.context.window {
+            Ok(owner)
+        } else {
+            Err("raw X11 clipboard owner verification failed".to_string())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreparedX11Clipboard {
+    snapshot: X11ClipboardSnapshot,
+    temporary_owner: u32,
+}
+
+#[derive(Debug)]
+struct X11ClipboardPasteError {
+    message: String,
+    can_fallback_to_xdotool: bool,
+    dispatched: bool,
+}
+
+impl X11ClipboardPasteError {
+    fn before_paste(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            can_fallback_to_xdotool: true,
+            dispatched: false,
+        }
+    }
+
+    fn preserving_clipboard(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            can_fallback_to_xdotool: false,
+            dispatched: false,
+        }
+    }
+
+    fn after_paste(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            can_fallback_to_xdotool: false,
+            dispatched: true,
+        }
+    }
+}
+
+fn x11_clipboard_owner() -> std::result::Result<u32, String> {
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    let (connection, _) = x11rb::connect(None)
+        .map_err(|error| format!("failed to connect to X11 for clipboard ownership: {error}"))?;
+    let clipboard = connection
+        .intern_atom(false, b"CLIPBOARD")
+        .map_err(|error| format!("failed to request the X11 CLIPBOARD atom: {error}"))?
+        .reply()
+        .map_err(|error| format!("failed to resolve the X11 CLIPBOARD atom: {error}"))?
+        .atom;
+    let owner = connection
+        .get_selection_owner(clipboard)
+        .map_err(|error| format!("failed to request the X11 clipboard owner: {error}"))?
+        .reply()
+        .map_err(|error| format!("failed to read the X11 clipboard owner: {error}"))?
+        .owner;
+    Ok(owner)
+}
+
+fn x11_clipboard_targets(deadline: Instant) -> std::result::Result<Vec<String>, String> {
+    use x11rb::{
+        connection::Connection,
+        protocol::{xproto::ConnectionExt, Event},
+    };
+
+    if Instant::now() >= deadline {
+        return Err("X11 clipboard snapshot exceeded its total deadline".to_string());
+    }
+    let (connection, screen_index) = x11rb::connect(None)
+        .map_err(|error| format!("failed to connect to X11 for clipboard targets: {error}"))?;
+    let screen = &connection.setup().roots[screen_index];
+    let requestor = connection
+        .generate_id()
+        .map_err(|error| format!("failed to allocate an X11 clipboard request window: {error}"))?;
+    connection
+        .create_window(
+            x11rb::COPY_FROM_PARENT as u8,
+            requestor,
+            screen.root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+            0,
+            &x11rb::protocol::xproto::CreateWindowAux::new(),
+        )
+        .map_err(|error| format!("failed to create an X11 clipboard request window: {error}"))?;
+    let clipboard = connection
+        .intern_atom(false, b"CLIPBOARD")
+        .map_err(|error| format!("failed to request the X11 CLIPBOARD atom: {error}"))?
+        .reply()
+        .map_err(|error| format!("failed to resolve the X11 CLIPBOARD atom: {error}"))?
+        .atom;
+    let targets = connection
+        .intern_atom(false, b"TARGETS")
+        .map_err(|error| format!("failed to request the X11 TARGETS atom: {error}"))?
+        .reply()
+        .map_err(|error| format!("failed to resolve the X11 TARGETS atom: {error}"))?
+        .atom;
+    let property = connection
+        .intern_atom(false, b"_CODEX_COMPUTER_USE_CLIPBOARD_TARGETS")
+        .map_err(|error| format!("failed to request the X11 target property atom: {error}"))?
+        .reply()
+        .map_err(|error| format!("failed to resolve the X11 target property atom: {error}"))?
+        .atom;
+    connection
+        .convert_selection(requestor, clipboard, targets, property, x11rb::CURRENT_TIME)
+        .map_err(|error| format!("failed to request X11 clipboard TARGETS: {error}"))?;
+    connection
+        .flush()
+        .map_err(|error| format!("failed to flush the X11 clipboard TARGETS request: {error}"))?;
+
+    let selection_property = loop {
+        if Instant::now() >= deadline {
+            let _ = connection.destroy_window(requestor);
+            return Err("X11 clipboard TARGETS request timed out".to_string());
+        }
+        match connection
+            .poll_for_event()
+            .map_err(|error| format!("failed while waiting for X11 clipboard TARGETS: {error}"))?
+        {
+            Some(Event::SelectionNotify(event)) if event.requestor == requestor => {
+                break event.property;
+            }
+            Some(_) | None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    if selection_property == x11rb::NONE {
+        let _ = connection.destroy_window(requestor);
+        return Err("the X11 clipboard owner did not provide TARGETS".to_string());
+    }
+    let reply = connection
+        .get_property(
+            false,
+            requestor,
+            selection_property,
+            x11rb::protocol::xproto::AtomEnum::ATOM,
+            0,
+            x11_clipboard_get_property_long_length(X11_CLIPBOARD_MAX_TARGETS * 4),
+        )
+        .map_err(|error| format!("failed to read X11 clipboard TARGETS: {error}"))?
+        .reply()
+        .map_err(|error| format!("failed to receive X11 clipboard TARGETS: {error}"))?;
+    if reply.bytes_after != 0 {
+        let _ = connection.destroy_window(requestor);
+        return Err(format!(
+            "X11 clipboard advertised more than {X11_CLIPBOARD_MAX_TARGETS} targets"
+        ));
+    }
+    let atoms = reply
+        .value32()
+        .ok_or_else(|| "X11 clipboard TARGETS did not contain atoms".to_string())?;
+    let mut names = Vec::new();
+    for atom in atoms {
+        if names.len() >= X11_CLIPBOARD_MAX_TARGETS {
+            let _ = connection.destroy_window(requestor);
+            return Err(format!(
+                "X11 clipboard advertised more than {X11_CLIPBOARD_MAX_TARGETS} targets"
+            ));
+        }
+        if Instant::now() >= deadline {
+            let _ = connection.destroy_window(requestor);
+            return Err("X11 clipboard snapshot exceeded its total deadline".to_string());
+        }
+        let name = connection
+            .get_atom_name(atom)
+            .map_err(|error| format!("failed to request an X11 clipboard target name: {error}"))?
+            .reply()
+            .map_err(|error| format!("failed to resolve an X11 clipboard target name: {error}"))?
+            .name;
+        names.push(String::from_utf8_lossy(&name).into_owned());
+    }
+    let _ = connection.destroy_window(requestor);
+    Ok(names)
+}
+
+fn x11_clipboard_target_is_protocol(target: &str) -> bool {
+    matches!(
+        target,
+        // ICCCM metadata, batching, transfer, and side-effect targets are not
+        // static clipboard formats and must never be replayed during a snapshot.
+        "TARGETS"
+            | "MULTIPLE"
+            | "TIMESTAMP"
+            | "INCR"
+            | "DELETE"
+            | "INSERT_SELECTION"
+            | "INSERT_PROPERTY"
+            // freedesktop clipboard-manager operation target.
+            | "SAVE_TARGETS"
+            // Deepin's clipboard manager advertises this ownership marker in
+            // TARGETS. It is protocol metadata, not restorable clipboard data.
+            | "FROM_DEEPIN_CLIPBOARD_MANAGER"
+    )
+}
+
+fn serve_x11_multi_target_clipboard(
+    context: Arc<x11_clipboard::Context>,
+    data: Arc<RwLock<HashMap<u32, X11ClipboardProperty>>>,
+) {
+    use x11rb::{
+        connection::Connection,
+        protocol::{
+            xproto::{
+                ConnectionExt, EventMask, PropMode, SelectionNotifyEvent, SELECTION_NOTIFY_EVENT,
+            },
+            Event,
+        },
+        wrapper::ConnectionExt as _,
+    };
+
+    while let Ok(event) = context.connection.wait_for_event() {
+        let Event::SelectionRequest(event) = event else {
+            continue;
+        };
+        if event.selection != context.atoms.clipboard {
+            continue;
+        }
+        let property = if event.property == x11rb::NONE {
+            event.target
+        } else {
+            event.property
+        };
+        let response_property = if event.target == context.atoms.targets {
+            let targets = data
+                .read()
+                .map(|data| {
+                    std::iter::once(context.atoms.targets)
+                        .chain(data.keys().copied())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|_| vec![context.atoms.targets]);
+            context
+                .connection
+                .change_property32(
+                    PropMode::REPLACE,
+                    event.requestor,
+                    property,
+                    x11rb::protocol::xproto::AtomEnum::ATOM,
+                    &targets,
+                )
+                .ok()
+                .and_then(|cookie| cookie.check().ok())
+                .map(|()| property)
+        } else {
+            data.read()
+                .ok()
+                .and_then(|data| data.get(&event.target).cloned())
+                .and_then(|value| {
+                    let item_count =
+                        x11_clipboard_property_item_count(value.format, value.bytes.len()).ok()?;
+                    context
+                        .connection
+                        .change_property(
+                            PropMode::REPLACE,
+                            event.requestor,
+                            property,
+                            value.type_atom,
+                            value.format,
+                            item_count,
+                            &value.bytes,
+                        )
+                        .ok()
+                        .and_then(|cookie| cookie.check().ok())
+                        .map(|()| property)
+                })
+        }
+        .unwrap_or(x11rb::NONE);
+        let _ = context.connection.send_event(
+            false,
+            event.requestor,
+            EventMask::NO_EVENT,
+            SelectionNotifyEvent {
+                response_type: SELECTION_NOTIFY_EVENT,
+                sequence: 0,
+                time: event.time,
+                requestor: event.requestor,
+                selection: event.selection,
+                target: event.target,
+                property: response_property,
+            },
+        );
+        let _ = context.connection.flush();
+    }
+}
+
+fn with_x11_clipboard<T>(
+    state: &Arc<Mutex<Option<arboard::Clipboard>>>,
+    operation: impl FnOnce(&mut arboard::Clipboard) -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "X11 clipboard state lock was poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(
+            arboard::Clipboard::new()
+                .map_err(|error| format!("failed to initialize the X11 clipboard: {error}"))?,
+        );
+    }
+    operation(
+        guard
+            .as_mut()
+            .expect("X11 clipboard is initialized before the operation"),
+    )
+}
+
+fn with_x11_raw_clipboard<T>(
+    state: &Arc<Mutex<Option<X11RawClipboard>>>,
+    operation: impl FnOnce(&mut X11RawClipboard) -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "raw X11 clipboard state lock was poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(X11RawClipboard::new()?);
+    }
+    operation(
+        guard
+            .as_mut()
+            .expect("raw X11 clipboard is initialized before the operation"),
+    )
+}
+
+fn restore_x11_clipboard_snapshot(
+    clipboard: &mut arboard::Clipboard,
+    raw_state: &Arc<Mutex<Option<X11RawClipboard>>>,
+    snapshot: &X11ClipboardSnapshot,
+) -> std::result::Result<(), String> {
+    match snapshot {
+        X11ClipboardSnapshot::Empty => clipboard
+            .clear()
+            .map_err(|error| format!("failed to restore an empty X11 clipboard: {error}")),
+        X11ClipboardSnapshot::Raw(targets) => {
+            with_x11_raw_clipboard(raw_state, |raw| raw.owner.set_targets(targets)).map(|_| ())
+        }
+    }
+}
+
+fn restore_x11_clipboard_snapshot_if_owner_matches(
+    clipboard: &mut arboard::Clipboard,
+    raw_state: &Arc<Mutex<Option<X11RawClipboard>>>,
+    snapshot: &X11ClipboardSnapshot,
+    expected_temporary_owner: u32,
+) -> std::result::Result<ClipboardRestoreDecision, String> {
+    let current_owner = x11_clipboard_owner().map_err(|error| {
+        format!("failed to verify the temporary X11 clipboard owner before restoration: {error}")
+    })?;
+    let decision = clipboard_restore_decision_for_known_owner(
+        Some(expected_temporary_owner),
+        Ok(current_owner),
+    );
+    if decision == ClipboardRestoreDecision::RestorePrevious {
+        restore_x11_clipboard_snapshot(clipboard, raw_state, snapshot)?;
+    }
+    Ok(decision)
+}
+
+fn x11_clipboard_error_after_failed_verification(
+    clipboard: &mut arboard::Clipboard,
+    raw_state: &Arc<Mutex<Option<X11RawClipboard>>>,
+    snapshot: &X11ClipboardSnapshot,
+    expected_temporary_owner: u32,
+    message: impl Into<String>,
+) -> X11ClipboardPasteError {
+    let message = message.into();
+    match restore_x11_clipboard_snapshot_if_owner_matches(
+        clipboard,
+        raw_state,
+        snapshot,
+        expected_temporary_owner,
+    ) {
+        Ok(ClipboardRestoreDecision::RestorePrevious) => {
+            X11ClipboardPasteError::before_paste(message)
+        }
+        Ok(ClipboardRestoreDecision::PreserveCurrent) => {
+            X11ClipboardPasteError::preserving_clipboard(format!(
+                "{message}; the X11 clipboard owner changed, so the newer contents were preserved"
+            ))
+        }
+        Ok(ClipboardRestoreDecision::Unreadable) => {
+            X11ClipboardPasteError::preserving_clipboard(format!(
+                "{message}; the X11 clipboard owner could not be verified, so it was left unchanged"
+            ))
+        }
+        Err(restore_error) => {
+            X11ClipboardPasteError::preserving_clipboard(format!("{message}; {restore_error}"))
+        }
+    }
+}
+
+fn prepare_x11_clipboard_text(
+    state: &Arc<Mutex<Option<arboard::Clipboard>>>,
+    raw_state: &Arc<Mutex<Option<X11RawClipboard>>>,
+    temporary: &str,
+) -> std::result::Result<PreparedX11Clipboard, X11ClipboardPasteError> {
+    let previous_owner = x11_clipboard_owner().map_err(X11ClipboardPasteError::before_paste)?;
+    let snapshot = if previous_owner == x11rb::NONE {
+        X11ClipboardSnapshot::Empty
+    } else {
+        let snapshot_deadline = Instant::now() + X11_CLIPBOARD_SNAPSHOT_TIMEOUT;
+        let target_names = x11_clipboard_targets(snapshot_deadline)
+            .map_err(X11ClipboardPasteError::preserving_clipboard)?;
+        let raw_targets = with_x11_raw_clipboard(raw_state, |raw| {
+            raw.snapshot_targets(&target_names, snapshot_deadline)
+        })
+        .map_err(X11ClipboardPasteError::preserving_clipboard)?;
+        X11ClipboardSnapshot::Raw(raw_targets)
+    };
+    let owner_after_snapshot =
+        x11_clipboard_owner().map_err(X11ClipboardPasteError::preserving_clipboard)?;
+    if owner_after_snapshot != previous_owner {
+        return Err(X11ClipboardPasteError::preserving_clipboard(
+            "the X11 clipboard owner changed while its contents were being snapshotted; preserving the newer clipboard",
+        ));
+    }
+    let mut guard = state.lock().map_err(|_| {
+        X11ClipboardPasteError::before_paste("X11 clipboard state lock was poisoned")
+    })?;
+    if guard.is_none() {
+        *guard = Some(arboard::Clipboard::new().map_err(|error| {
+            X11ClipboardPasteError::before_paste(format!(
+                "failed to initialize the X11 clipboard: {error}"
+            ))
+        })?);
+    }
+    let clipboard = guard
+        .as_mut()
+        .expect("X11 clipboard is initialized before preparation");
+    if let Err(error) = clipboard.set_text(temporary.to_string()) {
+        let message = format!("failed to set temporary X11 clipboard text: {error}");
+        let owner_after_write = x11_clipboard_owner();
+        let temporary_visible = clipboard
+            .get_text()
+            .is_ok_and(|actual| clipboard_write_was_verified(temporary, &actual));
+        return match owner_after_write {
+            Ok(owner) if temporary_visible => Err(x11_clipboard_error_after_failed_verification(
+                clipboard, raw_state, &snapshot, owner, message,
+            )),
+            Ok(owner) if owner == previous_owner => {
+                Err(X11ClipboardPasteError::before_paste(message))
+            }
+            Ok(_) => Err(X11ClipboardPasteError::preserving_clipboard(format!(
+                "{message}; another owner replaced the X11 clipboard, so its contents were preserved"
+            ))),
+            Err(owner_error) => Err(X11ClipboardPasteError::preserving_clipboard(format!(
+                "{message}; failed to identify the current X11 clipboard owner: {owner_error}"
+            ))),
+        };
+    }
+    let temporary_owner_before_readback = match x11_clipboard_owner() {
+        Ok(owner) => owner,
+        Err(owner_error) => {
+            return Err(X11ClipboardPasteError::preserving_clipboard(format!(
+                "failed to identify the temporary X11 clipboard owner before verification: {owner_error}; the clipboard was left unchanged because ownership could not be verified"
+            )));
+        }
+    };
+    let read_back = clipboard
+        .get_text()
+        .map_err(|error| format!("failed to verify temporary X11 clipboard text: {error}"));
+    match read_back {
+        Ok(actual) if clipboard_write_was_verified(temporary, &actual) => {
+            let temporary_owner_after_readback = x11_clipboard_owner().map_err(|owner_error| {
+                X11ClipboardPasteError::preserving_clipboard(format!(
+                    "failed to verify the temporary X11 clipboard owner after read-back: {owner_error}; the clipboard was left unchanged because ownership could not be verified"
+                ))
+            })?;
+            if temporary_owner_after_readback != temporary_owner_before_readback {
+                return Err(X11ClipboardPasteError::preserving_clipboard(
+                    "the X11 clipboard owner changed while temporary text was being verified; preserving the newer clipboard",
+                ));
+            }
+            Ok(PreparedX11Clipboard {
+                snapshot,
+                temporary_owner: temporary_owner_after_readback,
+            })
+        }
+        Ok(_) => Err(x11_clipboard_error_after_failed_verification(
+            clipboard,
+            raw_state,
+            &snapshot,
+            temporary_owner_before_readback,
+            "temporary X11 clipboard text did not match its read-back",
+        )),
+        Err(message) => Err(x11_clipboard_error_after_failed_verification(
+            clipboard,
+            raw_state,
+            &snapshot,
+            temporary_owner_before_readback,
+            message,
+        )),
+    }
+}
+
+fn finish_x11_clipboard_text(
+    state: &Arc<Mutex<Option<arboard::Clipboard>>>,
+    raw_state: &Arc<Mutex<Option<X11RawClipboard>>>,
+    prepared: &PreparedX11Clipboard,
+) -> std::result::Result<String, String> {
+    with_x11_clipboard(state, |clipboard| {
+        match clipboard_restore_decision(
+            prepared.temporary_owner,
+            x11_clipboard_owner().map_err(|_| ()),
+        ) {
+            ClipboardRestoreDecision::RestorePrevious => {
+                restore_x11_clipboard_snapshot(clipboard, raw_state, &prepared.snapshot)?;
+                Ok("Previous X11 clipboard contents were restored.".to_string())
+            }
+            ClipboardRestoreDecision::PreserveCurrent => Ok(
+                "The X11 clipboard changed after paste, so the newer contents were preserved."
+                    .to_string(),
+            ),
+            ClipboardRestoreDecision::Unreadable => Ok(
+                "Warning: the X11 clipboard became unreadable or non-text after paste; it was left unchanged to avoid overwriting newer contents."
+                    .to_string(),
+            ),
+        }
+    })
+}
+
+fn x11_paste_chord(terminal_target: bool) -> &'static str {
+    if terminal_target {
+        "ctrl+shift+v"
+    } else {
+        "ctrl+v"
+    }
+}
+
+fn window_uses_terminal_paste(window: &WindowInfo) -> bool {
+    if window.terminal.is_some() {
+        return true;
+    }
+    [
+        window.app_id.as_deref(),
+        window.wm_class.as_deref(),
+        window.title.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_ascii_lowercase)
+    .any(|value| {
+        [
+            "terminal",
+            "xterm",
+            "konsole",
+            "kitty",
+            "alacritty",
+            "wezterm",
+            "tilix",
+            "terminator",
+        ]
+        .iter()
+        .any(|marker| value.contains(marker))
+    })
+}
+
+async fn run_x11_clipboard_paste_text(
+    state: &Arc<Mutex<Option<arboard::Clipboard>>>,
+    raw_state: &Arc<Mutex<Option<X11RawClipboard>>>,
+    text: &str,
+    terminal_target: bool,
+) -> std::result::Result<String, X11ClipboardPasteError> {
+    let prepare_state = Arc::clone(state);
+    let prepare_raw_state = Arc::clone(raw_state);
+    let temporary = text.to_string();
+    let prepare_text = temporary.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_x11_clipboard_text(&prepare_state, &prepare_raw_state, &prepare_text)
+    })
+    .await
+    .map_err(|error| {
+        X11ClipboardPasteError::before_paste(format!(
+            "X11 clipboard preparation task failed: {error}"
+        ))
+    })??;
+
+    let expected_owner = prepared.temporary_owner;
+    let current_owner = tokio::task::spawn_blocking(x11_clipboard_owner)
+        .await
+        .map_err(|error| {
+            X11ClipboardPasteError::preserving_clipboard(format!(
+                "X11 clipboard owner verification task failed: {error}"
+            ))
+        })?
+        .map_err(X11ClipboardPasteError::preserving_clipboard)?;
+    if current_owner != expected_owner {
+        return Err(X11ClipboardPasteError::preserving_clipboard(
+            "the X11 clipboard owner changed before paste; preserving the newer clipboard",
+        ));
+    }
+
+    let paste_result = run_xdotool(&[
+        "key".to_string(),
+        "--clearmodifiers".to_string(),
+        x11_paste_chord(terminal_target).to_string(),
+    ])
+    .await;
+
+    if let Err(error) = paste_result {
+        let restore_state = Arc::clone(state);
+        let restore_raw_state = Arc::clone(raw_state);
+        let restore = tokio::task::spawn_blocking(move || {
+            finish_x11_clipboard_text(&restore_state, &restore_raw_state, &prepared)
+        })
+        .await
+        .map_err(|join_error| format!("X11 clipboard restore task failed: {join_error}"))
+        .and_then(|result| result);
+        let message = match restore {
+            Ok(note) => format!("{error}; {note}"),
+            Err(restore_error) => format!("{error}; {restore_error}"),
+        };
+        return Err(if error.starts_with("failed to run xdotool:") {
+            X11ClipboardPasteError::preserving_clipboard(message)
+        } else {
+            X11ClipboardPasteError::after_paste(message)
+        });
+    }
+
+    sleep(kde_clipboard_restore_delay(text)).await;
+    let finish_state = Arc::clone(state);
+    let finish_raw_state = Arc::clone(raw_state);
+    let finish = tokio::task::spawn_blocking(move || {
+        finish_x11_clipboard_text(&finish_state, &finish_raw_state, &prepared)
+    })
+    .await
+    .map_err(|error| format!("X11 clipboard restore task failed: {error}"))
+    .and_then(|result| result);
+
+    match finish {
+        Ok(note) => Ok(format!(
+            "Action pasted through the X11 clipboard using {}. {note}",
+            x11_paste_chord(terminal_target)
+        )),
+        Err(error) => Ok(format!(
+            "Action pasted through the X11 clipboard using {}. Warning: {error}",
+            x11_paste_chord(terminal_target)
+        )),
+    }
 }
 
 const EVDEV_KEY_LEFTCTRL: i32 = 29;
@@ -4491,9 +6183,22 @@ mod tests {
         out
     }
 
+    fn solid_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(width, height, image::Rgb([32, 128, 192]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut out),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        out
+    }
+
     #[test]
     fn window_crop_happens_before_screenshot_payload_resize() {
-        let (cropped, width, height) = crop_png(&solid_png(400, 200), 50, 20, 200, 100).unwrap();
+        let (cropped, width, height) =
+            crop_image_to_png(&solid_png(400, 200), 50, 20, 200, 100).unwrap();
         let capture = prepare_screenshot_payload(
             RawScreenshotCapture {
                 mime_type: "image/png".to_string(),
@@ -4517,6 +6222,81 @@ mod tests {
         );
         assert_eq!((capture.width, capture.height), (100, 50));
         assert!(capture.resized);
+    }
+
+    #[test]
+    fn targeted_window_crop_accepts_non_png_capture_sources() {
+        let (cropped, width, height) =
+            crop_image_to_png(&solid_jpeg(400, 200), 50, 20, 200, 100).unwrap();
+
+        assert_eq!((width, height), (200, 100));
+        assert_eq!(
+            image::guess_format(&cropped).unwrap(),
+            image::ImageFormat::Png
+        );
+    }
+
+    #[test]
+    fn targeted_window_crop_intersects_the_visible_capture() {
+        let negative_origin =
+            window_crop_rect_for_capture(&window_bounds(Some(-100), Some(-50), 300, 200), 800, 600)
+                .unwrap();
+        assert_eq!(
+            negative_origin,
+            WindowCropRect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 150,
+            }
+        );
+
+        let past_right_and_bottom =
+            window_crop_rect_for_capture(&window_bounds(Some(700), Some(550), 200, 100), 800, 600)
+                .unwrap();
+        assert_eq!(
+            past_right_and_bottom,
+            WindowCropRect {
+                x: 700,
+                y: 550,
+                width: 100,
+                height: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn targeted_window_crop_rejects_missing_empty_and_fully_offscreen_bounds() {
+        let missing_origin =
+            window_crop_rect_for_capture(&window_bounds(None, Some(10), 100, 100), 800, 600)
+                .unwrap_err();
+        assert!(missing_origin.contains("origin"));
+
+        let empty =
+            window_crop_rect_for_capture(&window_bounds(Some(10), Some(10), 0, 100), 800, 600)
+                .unwrap_err();
+        assert!(empty.contains("non-empty"));
+
+        let offscreen =
+            window_crop_rect_for_capture(&window_bounds(Some(-300), Some(10), 200, 100), 800, 600)
+                .unwrap_err();
+        assert!(offscreen.contains("outside"));
+    }
+
+    #[test]
+    fn targeted_window_crop_requires_capture_space_window_bounds() {
+        let mut window = window_info(
+            42,
+            Some("Target"),
+            Some("target-app"),
+            Some("target-app"),
+            Some(4242),
+        );
+        window.backend = GNOME_SHELL_EXTENSION_BACKEND.to_string();
+        assert!(!window_bounds_match_capture_space(&window));
+
+        window.backend = crate::windowing::XDOTOOL_BACKEND.to_string();
+        assert!(window_bounds_match_capture_space(&window));
     }
 
     fn window_info(
@@ -4906,6 +6686,177 @@ mod tests {
         );
     }
 
+    #[test]
+    fn x11_clipboard_backend_is_preferred_only_for_unforced_x11_keyboard_input() {
+        assert!(prefer_x11_clipboard_text_backend(true, false));
+        assert!(!prefer_x11_clipboard_text_backend(false, false));
+        assert!(!prefer_x11_clipboard_text_backend(true, true));
+    }
+
+    #[test]
+    fn x11_clipboard_write_requires_an_exact_read_back() {
+        assert!(clipboard_write_was_verified("temporary", "temporary"));
+        assert!(!clipboard_write_was_verified("temporary", "different"));
+    }
+
+    #[test]
+    fn x11_clipboard_raw_snapshot_keeps_private_target_bytes() {
+        let target = X11RawClipboardTarget {
+            name: "chromium/x-web-custom-data".to_string(),
+            atom: 123,
+            property: X11ClipboardProperty {
+                type_atom: 456,
+                format: 8,
+                bytes: vec![1, 2, 3, 4],
+            },
+        };
+        let snapshot = X11ClipboardSnapshot::Raw(vec![target]);
+
+        assert!(matches!(
+            snapshot,
+            X11ClipboardSnapshot::Raw(targets)
+                if targets[0].name == "chromium/x-web-custom-data"
+                    && targets[0].property.type_atom == 456
+                    && targets[0].property.format == 8
+                    && targets[0].property.bytes == vec![1, 2, 3, 4]
+        ));
+    }
+
+    #[test]
+    fn x11_clipboard_selection_accepts_actual_type_distinct_from_requested_target() {
+        let property = x11_clipboard_property_from_reply_parts(
+            417, // TEXT
+            587, // COMPOUND_TEXT
+            8,
+            b"restorable text".to_vec(),
+        )
+        .unwrap();
+
+        assert_eq!(property.type_atom, 587);
+        assert_eq!(property.format, 8);
+        assert_eq!(property.bytes, b"restorable text");
+    }
+
+    #[test]
+    fn x11_clipboard_restore_item_count_uses_the_saved_property_format() {
+        assert_eq!(x11_clipboard_property_item_count(8, 4).unwrap(), 4);
+        assert_eq!(x11_clipboard_property_item_count(16, 4).unwrap(), 2);
+        assert_eq!(x11_clipboard_property_item_count(32, 4).unwrap(), 1);
+        assert!(x11_clipboard_property_item_count(16, 3).is_err());
+        assert!(x11_clipboard_property_item_count(7, 4).is_err());
+    }
+
+    #[test]
+    fn x11_clipboard_protocol_targets_are_regenerated_not_snapshotted() {
+        assert!(x11_clipboard_target_is_protocol("TARGETS"));
+        assert!(x11_clipboard_target_is_protocol("MULTIPLE"));
+        assert!(x11_clipboard_target_is_protocol("TIMESTAMP"));
+        assert!(x11_clipboard_target_is_protocol("SAVE_TARGETS"));
+        assert!(x11_clipboard_target_is_protocol("DELETE"));
+        assert!(x11_clipboard_target_is_protocol("INSERT_SELECTION"));
+        assert!(x11_clipboard_target_is_protocol("INSERT_PROPERTY"));
+        assert!(x11_clipboard_target_is_protocol("INCR"));
+        assert!(x11_clipboard_target_is_protocol(
+            "FROM_DEEPIN_CLIPBOARD_MANAGER"
+        ));
+        assert!(!x11_clipboard_target_is_protocol("text/rtf"));
+        assert!(!x11_clipboard_target_is_protocol(
+            "chromium/x-web-custom-data"
+        ));
+    }
+
+    #[test]
+    fn x11_clipboard_snapshot_reads_and_aggregate_size_are_bounded() {
+        let long_length = x11_clipboard_get_property_long_length(X11_CLIPBOARD_MAX_SNAPSHOT_BYTES);
+        assert_ne!(long_length, u32::MAX);
+        assert!(long_length as usize * 4 <= X11_CLIPBOARD_MAX_SNAPSHOT_BYTES + 3);
+
+        assert_eq!(
+            x11_clipboard_snapshot_target_limit(0, usize::MAX).unwrap(),
+            X11_CLIPBOARD_MAX_SNAPSHOT_BYTES
+        );
+        assert_eq!(
+            x11_clipboard_snapshot_target_limit(X11_CLIPBOARD_MAX_SNAPSHOT_BYTES - 10, usize::MAX,)
+                .unwrap(),
+            10
+        );
+        assert!(
+            x11_clipboard_snapshot_target_limit(X11_CLIPBOARD_MAX_SNAPSHOT_BYTES, usize::MAX,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_clipboard_write_restores_only_for_a_known_current_owner() {
+        assert_eq!(
+            clipboard_restore_decision_for_known_owner(Some(100), Ok(100)),
+            ClipboardRestoreDecision::RestorePrevious
+        );
+        assert_eq!(
+            clipboard_restore_decision_for_known_owner(Some(100), Ok(200)),
+            ClipboardRestoreDecision::PreserveCurrent
+        );
+        assert_eq!(
+            clipboard_restore_decision_for_known_owner(None, Ok(100)),
+            ClipboardRestoreDecision::PreserveCurrent
+        );
+        assert_eq!(
+            clipboard_restore_decision_for_known_owner(Some(100), Err(())),
+            ClipboardRestoreDecision::Unreadable
+        );
+    }
+
+    #[test]
+    fn x11_clipboard_restore_does_not_overwrite_a_concurrent_change() {
+        assert_eq!(
+            clipboard_restore_decision(100, Ok(100)),
+            ClipboardRestoreDecision::RestorePrevious
+        );
+        assert_eq!(
+            clipboard_restore_decision(100, Ok(200)),
+            ClipboardRestoreDecision::PreserveCurrent
+        );
+        assert_eq!(
+            clipboard_restore_decision(100, Err(())),
+            ClipboardRestoreDecision::Unreadable
+        );
+    }
+
+    #[test]
+    fn x11_clipboard_same_text_from_a_new_owner_is_preserved() {
+        assert_eq!(
+            clipboard_restore_decision(100, Ok(200)),
+            ClipboardRestoreDecision::PreserveCurrent
+        );
+    }
+
+    #[test]
+    fn x11_clipboard_paste_never_falls_back_after_paste_was_dispatched() {
+        let before = X11ClipboardPasteError::before_paste("setup failed");
+        assert!(before.can_fallback_to_xdotool);
+        assert!(!before.dispatched);
+
+        let after = X11ClipboardPasteError::after_paste("paste result unknown");
+        assert!(!after.can_fallback_to_xdotool);
+        assert!(after.dispatched);
+    }
+
+    #[test]
+    fn x11_clipboard_uses_terminal_paste_chord_for_terminal_targets() {
+        assert_eq!(x11_paste_chord(false), "ctrl+v");
+        assert_eq!(x11_paste_chord(true), "ctrl+shift+v");
+
+        let mut terminal = window_info(
+            42,
+            Some("Deepin Terminal"),
+            Some("deepin-terminal"),
+            Some("deepin-terminal"),
+            Some(4242),
+        );
+        terminal.terminal = None;
+        assert!(window_uses_terminal_paste(&terminal));
+    }
+
     #[tokio::test]
     async fn kde_clipboard_dbus_operation_times_out_when_pending() {
         let error = kde_clipboard_dbus_operation_with_timeout(
@@ -4943,6 +6894,7 @@ mod tests {
     #[test]
     fn screenshot_coordinates_scale_to_physical_desktop_pixels() {
         let mapping = ScreenshotCoordinateMap {
+            screenshot_id: "shot-current".to_string(),
             image_width: 1920,
             image_height: 1080,
             coordinate_width: 2560,
@@ -4952,11 +6904,11 @@ mod tests {
         };
 
         assert_eq!(
-            screenshot_point_to_desktop(mapping, 900, 300).unwrap(),
+            screenshot_point_to_desktop(&mapping, 900, 300).unwrap(),
             (1200, 400)
         );
         assert_eq!(
-            screenshot_point_to_desktop(mapping, 1919, 1079).unwrap(),
+            screenshot_point_to_desktop(&mapping, 1919, 1079).unwrap(),
             (2559, 1439)
         );
     }
@@ -4964,6 +6916,7 @@ mod tests {
     #[test]
     fn cropped_screenshot_coordinates_include_desktop_origin() {
         let mapping = ScreenshotCoordinateMap {
+            screenshot_id: "shot-current".to_string(),
             image_width: 960,
             image_height: 540,
             coordinate_width: 1280,
@@ -4973,7 +6926,7 @@ mod tests {
         };
 
         assert_eq!(
-            screenshot_point_to_desktop(mapping, 480, 270).unwrap(),
+            screenshot_point_to_desktop(&mapping, 480, 270).unwrap(),
             (740, 410)
         );
     }
@@ -4981,10 +6934,13 @@ mod tests {
     #[test]
     fn screenshot_coordinate_conversion_requires_latest_mapping_and_in_range_points() {
         let backend = ComputerUseLinux::default();
-        let missing = backend.screenshot_point_to_desktop(10, 20).unwrap_err();
+        let missing = backend
+            .screenshot_point_to_desktop(10, 20, Some("shot-current"))
+            .unwrap_err();
         assert!(missing.contains("Call get_app_state or screenshot"));
 
         let mapping = ScreenshotCoordinateMap {
+            screenshot_id: "shot-current".to_string(),
             image_width: 1920,
             image_height: 1080,
             coordinate_width: 2560,
@@ -4993,7 +6949,20 @@ mod tests {
             origin_y: 0,
         };
         *backend.last_screenshot_coordinates.lock().unwrap() = Some(mapping);
-        let outside = backend.screenshot_point_to_desktop(1920, 100).unwrap_err();
+        let missing_id = backend
+            .screenshot_point_to_desktop(10, 20, None)
+            .unwrap_err();
+        assert!(missing_id.contains("screenshot_id is required"));
+
+        let stale = backend
+            .screenshot_point_to_desktop(10, 20, Some("shot-stale"))
+            .unwrap_err();
+        assert!(stale.contains("does not match"));
+        assert!(stale.contains("shot-current"));
+
+        let outside = backend
+            .screenshot_point_to_desktop(1920, 100, Some("shot-current"))
+            .unwrap_err();
         assert!(outside.contains("outside the most recently returned image"));
     }
 
@@ -5732,6 +7701,92 @@ mod tests {
     }
 
     #[test]
+    fn backend_success_only_proves_dispatch() {
+        let output = action_result_for_backend("type_text", Ok(Vec::new()), None, "xdotool");
+
+        assert!(output.ok);
+        assert!(output.dispatched);
+        assert_eq!(output.landed, None);
+        assert!(!output.verified);
+
+        let serialized = serde_json::to_value(output).unwrap();
+        assert_eq!(serialized["dispatched"], true);
+        assert_eq!(serialized["landed"], serde_json::Value::Null);
+        assert_eq!(serialized["verified"], false);
+    }
+
+    #[test]
+    fn non_editable_focus_marks_typed_text_as_not_landed() {
+        let element = FocusedElementSummary {
+            role: "list".to_string(),
+            name: Some("Extensions".to_string()),
+            editable: false,
+            states: vec!["focused".to_string()],
+        };
+        let feedback = focused_element_assessment(&element, true);
+        let output = with_action_feedback(
+            action_result_for_backend("type_text", Ok(Vec::new()), None, "xdotool"),
+            feedback,
+        );
+
+        assert!(!output.ok);
+        assert!(output.dispatched);
+        assert_eq!(output.landed, Some(false));
+        assert!(output.verified);
+        assert!(output.message.contains("not editable"));
+    }
+
+    #[test]
+    fn editable_focus_does_not_claim_the_text_effect_was_verified() {
+        let element = FocusedElementSummary {
+            role: "entry".to_string(),
+            name: Some("Configuration".to_string()),
+            editable: true,
+            states: vec!["focused".to_string()],
+        };
+        let feedback = focused_element_assessment(&element, true);
+        let output = with_action_feedback(
+            action_result_for_backend("type_text", Ok(Vec::new()), None, "xdotool"),
+            feedback,
+        );
+
+        assert!(output.ok);
+        assert!(output.dispatched);
+        assert_eq!(output.landed, None);
+        assert!(!output.verified);
+    }
+
+    #[test]
+    fn unavailable_focus_probe_does_not_claim_landing() {
+        let output = with_action_feedback(
+            action_result_for_backend("type_text", Ok(Vec::new()), None, "xdotool"),
+            ActionFeedback::unverified(
+                "Focused-element feedback unavailable (AT-SPI probe timed out).",
+            ),
+        );
+
+        assert!(output.ok);
+        assert!(output.dispatched);
+        assert_eq!(output.landed, None);
+        assert!(!output.verified);
+    }
+
+    #[test]
+    fn known_offscreen_pointer_target_is_a_verified_landing_failure() {
+        let output = with_action_feedback(
+            action_result_for_backend("click", Ok(Vec::new()), None, "xdotool"),
+            ActionFeedback::failed_landing(
+                "WARNING: coordinate 3000,2000 is outside the captured desktop.",
+            ),
+        );
+
+        assert!(!output.ok);
+        assert!(output.dispatched);
+        assert_eq!(output.landed, Some(false));
+        assert!(output.verified);
+    }
+
+    #[test]
     fn relative_scroll_translates_coordinates() {
         let mut params = ScrollParams {
             element_index: None,
@@ -5746,6 +7801,7 @@ mod tests {
             window_title: None,
             relative: Some(true),
             coordinate_space: CoordinateSpace::Desktop,
+            screenshot_id: None,
         };
         let focus = WindowFocusResult {
             requested_window: window_with_bounds(1, 100, 200, 800, 600),
@@ -5775,6 +7831,7 @@ mod tests {
             window_title: None,
             relative: None,
             coordinate_space: CoordinateSpace::Desktop,
+            screenshot_id: None,
         };
         let focus = WindowFocusResult {
             requested_window: window_with_bounds(1, 100, 200, 800, 600),
@@ -5804,6 +7861,7 @@ mod tests {
             window_title: None,
             relative: None,
             coordinate_space: CoordinateSpace::Desktop,
+            screenshot_id: None,
         };
         let mut window = window_with_bounds(1, 0, 0, 1, 1);
         window.bounds = None;
@@ -5836,6 +7894,7 @@ mod tests {
             window_title: None,
             relative: Some(true),
             coordinate_space: CoordinateSpace::Desktop,
+            screenshot_id: None,
         };
         let focus = WindowFocusResult {
             requested_window: window_with_bounds(1, 100, 200, 800, 600),

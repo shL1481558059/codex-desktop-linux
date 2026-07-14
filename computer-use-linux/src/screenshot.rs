@@ -44,6 +44,9 @@ pub struct RawScreenshotCapture {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ScreenshotCapture {
+    /// Opaque identifier required when later actions address pixels in this
+    /// screenshot. A newer capture replaces the cached coordinate mapping.
+    pub screenshot_id: String,
     pub mime_type: String,
     pub data_url: String,
     pub source: String,
@@ -281,6 +284,7 @@ pub fn prepare_screenshot_payload(
     };
 
     Ok(ScreenshotCapture {
+        screenshot_id: new_screenshot_id()?,
         mime_type: options.format.mime_type().to_string(),
         data_url: format!("data:{};base64,{encoded}", options.format.mime_type()),
         source: raw.source,
@@ -298,6 +302,18 @@ pub fn prepare_screenshot_payload(
         format: options.format,
         quality: (options.format == ScreenshotOutputFormat::Jpeg).then_some(options.quality),
     })
+}
+
+fn new_screenshot_id() -> Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| anyhow!("generate screenshot id: {error}"))?;
+    let mut id = String::with_capacity(random.len() * 2);
+    for byte in random {
+        id.push(HEX[(byte >> 4) as usize] as char);
+        id.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(id)
 }
 
 async fn capture_with_gnome_shell() -> Result<RawScreenshotCapture> {
@@ -903,6 +919,23 @@ mod tests {
         assert!(capture.resized);
         assert!(capture.bytes <= DEFAULT_SCREENSHOT_MAX_BYTES);
         assert!(capture.data_url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn every_returned_screenshot_has_a_distinct_id() {
+        let first = prepare_screenshot_payload(
+            raw_capture(solid_png(10, 10)),
+            ScreenshotPayloadOptions::default(),
+        )
+        .unwrap();
+        let second = prepare_screenshot_payload(
+            raw_capture(solid_png(10, 10)),
+            ScreenshotPayloadOptions::default(),
+        )
+        .unwrap();
+
+        assert!(!first.screenshot_id.is_empty());
+        assert_ne!(first.screenshot_id, second.screenshot_id);
     }
 
     #[test]
