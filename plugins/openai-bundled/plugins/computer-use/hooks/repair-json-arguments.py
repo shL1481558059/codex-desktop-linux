@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Repair the one known malformed Computer Use image-format argument shape."""
+"""Repair legacy image JSON and block direct shell pointer injection."""
 
 from __future__ import annotations
 
 import json
+import os
+import re
+import shlex
 import sys
 from typing import Optional
 
@@ -13,6 +16,8 @@ ALLOWED_TOOLS = {
     "mcp__computer_use__screenshot",
 }
 ALLOWED_FORMATS = {"jpeg", "png"}
+SHELL_TOOLS = {"exec_command", "Bash", "shell"}
+SHELL_WRAPPERS = {"command", "env", "nohup", "sudo"}
 
 
 def skip_whitespace(text: str, index: int) -> int:
@@ -146,6 +151,47 @@ def repair_tool_input(raw_input: object) -> Optional[dict]:
     return repaired if isinstance(repaired, dict) else None
 
 
+def shell_command(raw_input: object) -> Optional[str]:
+    if isinstance(raw_input, str):
+        return raw_input
+    if not isinstance(raw_input, dict):
+        return None
+    for key in ("cmd", "command"):
+        value = raw_input.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def denied_shell_input(tool_name: object, raw_input: object) -> bool:
+    if tool_name not in SHELL_TOOLS:
+        return False
+    command = shell_command(raw_input)
+    if command is None:
+        return False
+    for segment in re.split(r"[;&|()\n]+", command):
+        try:
+            tokens = shlex.split(segment, comments=True)
+        except ValueError:
+            continue
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if "=" in token and not token.startswith("/"):
+                index += 1
+                continue
+            executable = os.path.basename(token)
+            if executable in SHELL_WRAPPERS:
+                index += 1
+                while index < len(tokens) and tokens[index].startswith("-"):
+                    index += 1
+                continue
+            if executable in {"xdotool", "ydotool"}:
+                return True
+            break
+    return False
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -153,7 +199,31 @@ def main() -> int:
         print("{}")
         return 0
 
-    if not isinstance(event, dict) or event.get("tool_name") not in ALLOWED_TOOLS:
+    if not isinstance(event, dict):
+        print("{}")
+        return 0
+
+    tool_name = event.get("tool_name")
+    if denied_shell_input(tool_name, event.get("tool_input")):
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Direct shell xdotool/ydotool input is disabled. "
+                            "Use the Computer Use click, scroll, drag, keyboard, or text tools."
+                        ),
+                    }
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        return 0
+
+    if tool_name not in ALLOWED_TOOLS:
         print("{}")
         return 0
 

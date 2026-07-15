@@ -9,6 +9,15 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/repair-json-arguments.py\""
           }
         ]
+      },
+      {
+        "matcher": "^(exec_command|Bash|shell)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/repair-json-arguments.py\""
+          }
+        ]
       }
     ]
   }

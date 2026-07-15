@@ -416,7 +416,7 @@ pub fn ranked_recorders(diagnostics: &DoctorReport) -> Vec<String> {
 
 async fn capture_initial_screenshot(bundle_dir: &Path) -> Result<Option<TimelineEvent>> {
     let raw = screenshot::capture_screenshot_raw().await?;
-    let extension = if raw.mime_type == "image/jpeg" {
+    let extension = if screenshot::detected_mime_type(&raw.bytes)? == "image/jpeg" {
         "jpg"
     } else {
         "png"

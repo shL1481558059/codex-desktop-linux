@@ -4531,14 +4531,14 @@ test_bundled_plugin_builders_accept_prebuilt_binaries() {
     [ ! -e "$staged_plugins/computer-use/bin/computer-use-linux-cosmic" ] \
         || fail "Vendored/prebuilt Computer Use staging must not add the external helper alias"
     assert_file_exists "$staged_plugins/computer-use/hooks/repair-json-arguments.py"
-    assert_file_exists "$staged_plugins/computer-use/hooks.json"
+    assert_file_exists "$staged_plugins/computer-use/hooks/hooks.json"
 }
 
 test_computer_use_json_argument_repair_hook() {
     info "Checking Computer Use JSON argument repair hook"
     local hook="$REPO_DIR/plugins/openai-bundled/plugins/computer-use/hooks/repair-json-arguments.py"
     local plugin_root="$REPO_DIR/plugins/openai-bundled/plugins/computer-use"
-    local hooks_config="$plugin_root/hooks.json"
+    local hooks_config="$plugin_root/hooks/hooks.json"
     local plugin_manifest="$plugin_root/.codex-plugin/plugin.json"
     assert_file_exists "$hook"
     assert_file_exists "$hooks_config"
@@ -4555,14 +4555,19 @@ import tempfile
 hook = pathlib.Path(sys.argv[1])
 hooks_config = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 plugin_manifest = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
-if plugin_manifest.get("version") != "0.1.2-linux-alpha4":
+if plugin_manifest.get("version") != "0.1.2-linux-alpha5":
     raise SystemExit("Computer Use plugin version must refresh the cached Hook bundle")
+if plugin_manifest.get("hooks") != "./hooks/hooks.json":
+    raise SystemExit("Computer Use manifest must declare the discoverable Hook config")
 matcher = hooks_config["hooks"]["PreToolUse"][0]
 if matcher["matcher"] != r"^mcp__computer_use__(get_app_state|screenshot)$":
     raise SystemExit("Computer Use hook matcher must stay limited to screenshot and get_app_state")
 command = matcher["hooks"][0]["command"]
 if command != 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/repair-json-arguments.py"':
     raise SystemExit("Computer Use hook must resolve its script from the installed plugin root")
+shell_matcher = hooks_config["hooks"]["PreToolUse"][1]
+if shell_matcher["matcher"] != r"^(exec_command|Bash|shell)$":
+    raise SystemExit("Computer Use hook must intercept direct shell input backends")
 
 def run(tool_name, tool_input):
     event = {
@@ -4634,6 +4639,21 @@ for tool_name, tool_input in unchanged:
     result = run(tool_name, tool_input)
     if updated_input(result) is not None:
         raise SystemExit(f"hook changed an out-of-scope payload: {tool_name} {tool_input} -> {result}")
+
+blocked = run("exec_command", {"cmd": "xdotool mousemove 10 20 click 1"})
+blocked_output = blocked.get("hookSpecificOutput", {})
+if blocked_output.get("permissionDecision") != "deny":
+    raise SystemExit(f"direct xdotool command was not denied: {blocked}")
+if "Computer Use" not in blocked_output.get("permissionDecisionReason", ""):
+    raise SystemExit("direct-input denial must tell the model to use Computer Use tools")
+
+blocked_path = run("Bash", {"command": "/usr/bin/ydotool click 1"})
+if blocked_path.get("hookSpecificOutput", {}).get("permissionDecision") != "deny":
+    raise SystemExit(f"absolute ydotool command was not denied: {blocked_path}")
+
+allowed_shell = run("exec_command", {"cmd": "grep -R xdotool docs"})
+if allowed_shell.get("hookSpecificOutput") is not None:
+    raise SystemExit(f"non-executable xdotool mention was incorrectly denied: {allowed_shell}")
 PY
 }
 

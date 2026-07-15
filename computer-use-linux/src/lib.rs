@@ -1,9 +1,12 @@
 pub mod abs_pointer;
+pub mod action_verification;
 pub mod atspi_tree;
+pub mod capture_transform;
 pub mod cosmic_helper;
 pub mod diagnostics;
 pub mod gnome_extension;
 pub mod identity;
+pub mod ocr;
 pub mod remote_desktop;
 pub mod screenshot;
 pub mod server;

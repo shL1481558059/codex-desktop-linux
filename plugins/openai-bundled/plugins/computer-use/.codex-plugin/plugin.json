@@ -1,6 +1,6 @@
 {
   "name": "computer-use",
-  "version": "0.1.2-linux-alpha4",
+  "version": "0.1.2-linux-alpha5",
   "description": "Control desktop apps on Linux from Codex through Computer Use.",
   "author": {
     "name": "avifenesh"
@@ -17,6 +17,7 @@
     "accessibility"
   ],
   "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Computer Use",
     "shortDescription": "Control Linux desktop apps from Codex",

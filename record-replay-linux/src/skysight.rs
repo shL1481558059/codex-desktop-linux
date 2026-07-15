@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use codex_computer_use_linux::{
     atspi_tree,
-    screenshot::{self, ScreenshotOutputFormat, ScreenshotPayloadOptions},
+    screenshot::{self, ScreenshotEncodingPolicy, ScreenshotPayloadOptions},
     windowing,
 };
 use serde::{Deserialize, Serialize};
@@ -1361,7 +1361,8 @@ async fn capture_screenshot_evidence(
 
     match screenshot::capture_screenshot_raw().await {
         Ok(raw) => {
-            let extension = if raw.mime_type == "image/jpeg" {
+            let mime_type = screenshot::detected_mime_type(&raw.bytes)?;
+            let extension = if mime_type == "image/jpeg" {
                 "jpg"
             } else {
                 "png"
@@ -1387,7 +1388,7 @@ async fn capture_screenshot_evidence(
                 "kind": "screenshot",
                 "file": relative.to_string_lossy(),
                 "path": absolute,
-                "mime_type": raw.mime_type,
+                "mime_type": mime_type,
                 "capture_source": raw.source,
                 "width": raw.width,
                 "height": raw.height,
@@ -1574,8 +1575,7 @@ fn write_chronicle_screen_recording_artifacts_inner(
     let jpeg_payload = screenshot::prepare_screenshot_payload(
         raw.clone(),
         ScreenshotPayloadOptions {
-            format: Some(ScreenshotOutputFormat::Jpeg),
-            quality: Some(80),
+            encoding: ScreenshotEncodingPolicy::Jpeg { quality: 80 },
             ..ScreenshotPayloadOptions::default()
         },
     )?;

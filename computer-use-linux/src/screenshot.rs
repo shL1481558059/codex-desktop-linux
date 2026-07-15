@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     collections::HashMap,
     fs,
@@ -28,14 +28,14 @@ pub const DEFAULT_SCREENSHOT_MAX_DIMENSION: u32 = 1920;
 pub const DEFAULT_SCREENSHOT_MAX_BYTES: usize = 2 * 1024 * 1024;
 pub const ABSOLUTE_SCREENSHOT_MAX_DIMENSION: u32 = 4096;
 pub const ABSOLUTE_SCREENSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
-pub const DEFAULT_SCREENSHOT_JPEG_QUALITY: u8 = 80;
 pub const MIN_SCREENSHOT_JPEG_QUALITY: u8 = 1;
 pub const MAX_SCREENSHOT_JPEG_QUALITY: u8 = 95;
+const ADAPTIVE_JPEG_MIN_QUALITY: u8 = 35;
+const ADAPTIVE_JPEG_MAX_QUALITY: u8 = 92;
 const MIN_SCREENSHOT_MAX_BYTES: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct RawScreenshotCapture {
-    pub mime_type: String,
     pub bytes: Vec<u8>,
     pub source: String,
     pub width: u32,
@@ -66,14 +66,23 @@ pub struct ScreenshotCapture {
     /// Desktop physical-pixel origin represented by coordinate (0, 0) in the
     /// returned image. Non-zero for a screenshot cropped to a window.
     pub coordinate_origin_y: i32,
-    /// Returned pixels per coordinate-space pixel.
-    pub scale: f32,
+    pub cropped_to_window: bool,
+    pub target_window_id: Option<u64>,
     pub resized: bool,
     pub bytes: usize,
     pub original_bytes: usize,
     pub max_bytes: usize,
-    pub format: ScreenshotOutputFormat,
-    pub quality: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScreenshotEncodingPolicy {
+    /// Preserve lossless PNG whenever it satisfies the caller's byte budget;
+    /// otherwise use the highest JPEG quality that fits before reducing size.
+    #[default]
+    Adaptive,
+    /// Always emit JPEG at exactly the requested quality. If needed, only the
+    /// output dimensions are reduced to satisfy the byte budget.
+    Jpeg { quality: u8 },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -81,25 +90,7 @@ pub struct ScreenshotPayloadOptions {
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
     pub max_bytes: Option<usize>,
-    pub scale: Option<f32>,
-    pub format: Option<ScreenshotOutputFormat>,
-    pub quality: Option<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ScreenshotOutputFormat {
-    Png,
-    Jpeg,
-}
-
-impl ScreenshotOutputFormat {
-    fn mime_type(self) -> &'static str {
-        match self {
-            Self::Png => "image/png",
-            Self::Jpeg => "image/jpeg",
-        }
-    }
+    pub encoding: ScreenshotEncodingPolicy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,9 +98,7 @@ struct ResolvedScreenshotPayloadOptions {
     max_width: u32,
     max_height: u32,
     max_bytes: usize,
-    scale: f32,
-    format: ScreenshotOutputFormat,
-    quality: u8,
+    encoding: ScreenshotEncodingPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,24 +121,11 @@ impl ScreenshotPayloadOptions {
             .max_bytes
             .unwrap_or(DEFAULT_SCREENSHOT_MAX_BYTES)
             .clamp(MIN_SCREENSHOT_MAX_BYTES, ABSOLUTE_SCREENSHOT_MAX_BYTES);
-        let scale = self
-            .scale
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(1.0)
-            .min(1.0);
-        let format = self.format.unwrap_or(ScreenshotOutputFormat::Png);
-        let quality = self
-            .quality
-            .unwrap_or(DEFAULT_SCREENSHOT_JPEG_QUALITY)
-            .clamp(MIN_SCREENSHOT_JPEG_QUALITY, MAX_SCREENSHOT_JPEG_QUALITY);
-
         ResolvedScreenshotPayloadOptions {
             max_width,
             max_height,
             max_bytes,
-            scale,
-            format,
-            quality,
+            encoding: self.encoding,
         }
     }
 }
@@ -261,48 +237,34 @@ pub fn prepare_screenshot_payload(
     let (target_width, target_height) =
         target_dimensions(coordinate_width, coordinate_height, options);
 
-    let (bytes, width, height) = if raw.mime_type == options.format.mime_type()
-        && target_width == coordinate_width
-        && target_height == coordinate_height
-        && original_bytes <= options.max_bytes
-    {
-        (raw.bytes, coordinate_width, coordinate_height)
-    } else {
-        encode_screenshot_to_fit_bytes(
-            &raw.bytes,
-            coordinate_width,
-            coordinate_height,
-            target_width,
-            target_height,
-            options,
-        )?
-    };
+    let encoded = encode_screenshot_to_fit_bytes(
+        &raw.bytes,
+        coordinate_width,
+        coordinate_height,
+        target_width,
+        target_height,
+        options,
+    )?;
 
-    let encoded = STANDARD.encode(&bytes);
-    let scale = if coordinate_width == 0 {
-        1.0
-    } else {
-        width as f32 / coordinate_width as f32
-    };
+    let data = STANDARD.encode(&encoded.bytes);
 
     Ok(ScreenshotCapture {
         screenshot_id: new_screenshot_id()?,
-        mime_type: options.format.mime_type().to_string(),
-        data_url: format!("data:{};base64,{encoded}", options.format.mime_type()),
+        mime_type: encoded.mime_type.to_string(),
+        data_url: format!("data:{};base64,{data}", encoded.mime_type),
         source: raw.source,
-        width,
-        height,
+        width: encoded.width,
+        height: encoded.height,
         coordinate_width,
         coordinate_height,
         coordinate_origin_x: 0,
         coordinate_origin_y: 0,
-        scale,
-        resized: width != coordinate_width || height != coordinate_height,
-        bytes: bytes.len(),
+        cropped_to_window: false,
+        target_window_id: None,
+        resized: encoded.width != coordinate_width || encoded.height != coordinate_height,
+        bytes: encoded.bytes.len(),
         original_bytes,
         max_bytes: options.max_bytes,
-        format: options.format,
-        quality: (options.format == ScreenshotOutputFormat::Jpeg).then_some(options.quality),
     })
 }
 
@@ -556,9 +518,8 @@ fn read_image_as_capture_inner(path: &Path, source: &str) -> Result<RawScreensho
     if bytes.is_empty() {
         bail!("screenshot file was empty: {}", path.display());
     }
-    let (format, width, height) = image_metadata(&bytes)?;
+    let (_, width, height) = image_metadata(&bytes)?;
     Ok(RawScreenshotCapture {
-        mime_type: image_format_mime_type(format).to_string(),
         bytes,
         source: source.to_string(),
         width,
@@ -573,14 +534,18 @@ fn target_dimensions(
 ) -> (u32, u32) {
     let width_scale = options.max_width as f64 / width as f64;
     let height_scale = options.max_height as f64 / height as f64;
-    let scale = f64::from(options.scale)
-        .min(width_scale)
-        .min(height_scale)
-        .min(1.0);
+    let scale = width_scale.min(height_scale).min(1.0);
 
     let target_width = ((width as f64 * scale).round() as u32).clamp(1, width);
     let target_height = ((height as f64 * scale).round() as u32).clamp(1, height);
     (target_width, target_height)
+}
+
+struct EncodedScreenshot {
+    bytes: Vec<u8>,
+    mime_type: &'static str,
+    width: u32,
+    height: u32,
 }
 
 fn encode_screenshot_to_fit_bytes(
@@ -590,38 +555,69 @@ fn encode_screenshot_to_fit_bytes(
     mut target_width: u32,
     mut target_height: u32,
     options: ResolvedScreenshotPayloadOptions,
-) -> Result<(Vec<u8>, u32, u32)> {
+) -> Result<EncodedScreenshot> {
     let input_format = supported_image_format(raw)?;
-    let output_format = match options.format {
-        ScreenshotOutputFormat::Png => image::ImageFormat::Png,
-        ScreenshotOutputFormat::Jpeg => image::ImageFormat::Jpeg,
-    };
     let img =
         image::load_from_memory(raw).context("failed to decode screenshot image for encoding")?;
 
     loop {
-        let bytes = if input_format == output_format
-            && target_width == original_width
-            && target_height == original_height
-        {
-            raw.to_vec()
+        let output = if target_width == original_width && target_height == original_height {
+            img.clone()
         } else {
-            let output = if target_width == original_width && target_height == original_height {
-                img.clone()
-            } else {
-                img.resize_exact(target_width, target_height, FilterType::Lanczos3)
-            };
-            encode_image(&output, options)?
+            img.resize_exact(target_width, target_height, FilterType::Lanczos3)
         };
 
-        if bytes.len() <= options.max_bytes {
-            return Ok((bytes, target_width, target_height));
+        let (candidate_bytes, mime_type) = match options.encoding {
+            ScreenshotEncodingPolicy::Adaptive => {
+                let png = if input_format == image::ImageFormat::Png
+                    && target_width == original_width
+                    && target_height == original_height
+                {
+                    raw.to_vec()
+                } else {
+                    encode_png(&output)?
+                };
+                if png.len() <= options.max_bytes {
+                    return Ok(EncodedScreenshot {
+                        bytes: png,
+                        mime_type: "image/png",
+                        width: target_width,
+                        height: target_height,
+                    });
+                }
+                match highest_jpeg_quality_within_budget(&output, options.max_bytes)? {
+                    Some(jpeg) => {
+                        return Ok(EncodedScreenshot {
+                            bytes: jpeg,
+                            mime_type: "image/jpeg",
+                            width: target_width,
+                            height: target_height,
+                        });
+                    }
+                    None => (
+                        encode_jpeg(&output, ADAPTIVE_JPEG_MIN_QUALITY)?,
+                        "image/jpeg",
+                    ),
+                }
+            }
+            ScreenshotEncodingPolicy::Jpeg { quality } => {
+                (encode_jpeg(&output, quality)?, "image/jpeg")
+            }
+        };
+
+        if candidate_bytes.len() <= options.max_bytes {
+            return Ok(EncodedScreenshot {
+                bytes: candidate_bytes,
+                mime_type,
+                width: target_width,
+                height: target_height,
+            });
         }
 
         if target_width == 1 && target_height == 1 {
             bail!(
                 "screenshot payload is {} bytes at 1x1, over max_bytes {}",
-                bytes.len(),
+                candidate_bytes.len(),
                 options.max_bytes
             );
         }
@@ -629,30 +625,51 @@ fn encode_screenshot_to_fit_bytes(
         (target_width, target_height) = next_dimensions_for_byte_cap(
             target_width,
             target_height,
-            bytes.len(),
+            candidate_bytes.len(),
             options.max_bytes,
         );
     }
 }
 
-fn encode_image(
-    img: &image::DynamicImage,
-    options: ResolvedScreenshotPayloadOptions,
-) -> Result<Vec<u8>> {
+fn encode_png(img: &image::DynamicImage) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    match options.format {
-        ScreenshotOutputFormat::Png => {
-            img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
-                .context("failed to encode screenshot PNG")?;
-        }
-        ScreenshotOutputFormat::Jpeg => {
-            let rgb = img.to_rgb8();
-            JpegEncoder::new_with_quality(&mut out, options.quality)
-                .encode_image(&rgb)
-                .context("failed to encode screenshot JPEG")?;
+    img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+        .context("failed to encode screenshot PNG")?;
+    Ok(out)
+}
+
+fn encode_jpeg(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let rgb = img.to_rgb8();
+    JpegEncoder::new_with_quality(&mut out, quality)
+        .encode_image(&rgb)
+        .context("failed to encode screenshot JPEG")?;
+    Ok(out)
+}
+
+fn highest_jpeg_quality_within_budget(
+    img: &image::DynamicImage,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    let minimum = encode_jpeg(img, ADAPTIVE_JPEG_MIN_QUALITY)?;
+    if minimum.len() > max_bytes {
+        return Ok(None);
+    }
+
+    let mut best = minimum;
+    let mut low = ADAPTIVE_JPEG_MIN_QUALITY.saturating_add(1);
+    let mut high = ADAPTIVE_JPEG_MAX_QUALITY;
+    while low <= high {
+        let quality = low + (high - low) / 2;
+        let encoded = encode_jpeg(img, quality)?;
+        if encoded.len() <= max_bytes {
+            best = encoded;
+            low = quality.saturating_add(1);
+        } else {
+            high = quality.saturating_sub(1);
         }
     }
-    Ok(out)
+    Ok(Some(best))
 }
 
 fn next_dimensions_for_byte_cap(
@@ -687,11 +704,15 @@ fn supported_image_format(bytes: &[u8]) -> Result<image::ImageFormat> {
     }
 }
 
-fn image_format_mime_type(format: image::ImageFormat) -> &'static str {
-    match format {
-        image::ImageFormat::Png => "image/png",
-        image::ImageFormat::Jpeg => "image/jpeg",
-        _ => unreachable!("unsupported screenshot image format"),
+// The binary target compiles this module directly while the recorder consumes
+// this API through the library target, so it is intentionally unused in one
+// of the two compilations.
+#[allow(dead_code)]
+pub fn detected_mime_type(bytes: &[u8]) -> Result<&'static str> {
+    match supported_image_format(bytes)? {
+        image::ImageFormat::Png => Ok("image/png"),
+        image::ImageFormat::Jpeg => Ok("image/jpeg"),
+        _ => unreachable!("supported_image_format only returns PNG or JPEG"),
     }
 }
 
@@ -830,13 +851,8 @@ mod tests {
     }
 
     fn raw_capture(bytes: Vec<u8>) -> RawScreenshotCapture {
-        raw_capture_with_mime(bytes, "image/png")
-    }
-
-    fn raw_capture_with_mime(bytes: Vec<u8>, mime_type: &str) -> RawScreenshotCapture {
         let (width, height) = image_dimensions(&bytes).unwrap();
         RawScreenshotCapture {
-            mime_type: mime_type.to_string(),
             bytes,
             source: "test".to_string(),
             width,
@@ -984,23 +1000,55 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_format_compresses_when_requested() {
+    fn adaptive_payload_prefers_png_when_it_fits() {
         let capture = prepare_screenshot_payload(
-            raw_capture(noisy_png(512, 512)),
+            raw_capture(solid_png(256, 128)),
             ScreenshotPayloadOptions {
-                max_width: Some(512),
-                max_height: Some(512),
-                max_bytes: Some(DEFAULT_SCREENSHOT_MAX_BYTES),
-                format: Some(ScreenshotOutputFormat::Jpeg),
-                quality: Some(60),
+                max_width: Some(256),
+                max_height: Some(128),
+                max_bytes: Some(100_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(capture.mime_type, "image/png");
+        assert_eq!((capture.width, capture.height), (256, 128));
+        assert!(capture.bytes <= 100_000);
+    }
+
+    #[test]
+    fn adaptive_payload_uses_jpeg_before_discarding_resolution() {
+        let capture = prepare_screenshot_payload(
+            raw_capture(noisy_png(256, 256)),
+            ScreenshotPayloadOptions {
+                max_width: Some(256),
+                max_height: Some(256),
+                max_bytes: Some(100_000),
                 ..Default::default()
             },
         )
         .unwrap();
 
         assert_eq!(capture.mime_type, "image/jpeg");
-        assert_eq!(capture.format, ScreenshotOutputFormat::Jpeg);
-        assert_eq!(capture.quality, Some(60));
+        assert_eq!((capture.width, capture.height), (256, 256));
+        assert!(capture.bytes <= 100_000);
+    }
+
+    #[test]
+    fn forced_jpeg_uses_requested_quality_policy() {
+        let capture = prepare_screenshot_payload(
+            raw_capture(noisy_png(512, 512)),
+            ScreenshotPayloadOptions {
+                max_width: Some(512),
+                max_height: Some(512),
+                max_bytes: Some(DEFAULT_SCREENSHOT_MAX_BYTES),
+                encoding: ScreenshotEncodingPolicy::Jpeg { quality: 60 },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(capture.mime_type, "image/jpeg");
         assert_eq!((capture.width, capture.height), (512, 512));
         assert_eq!(
             (capture.coordinate_width, capture.coordinate_height),
@@ -1013,7 +1061,7 @@ mod tests {
     #[test]
     fn default_payload_transcodes_jpeg_to_png() {
         let capture = prepare_screenshot_payload(
-            raw_capture_with_mime(solid_jpeg(64, 32), "image/jpeg"),
+            raw_capture(solid_jpeg(64, 32)),
             ScreenshotPayloadOptions {
                 max_width: Some(64),
                 max_height: Some(32),
@@ -1064,7 +1112,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(capture.mime_type, "image/jpeg");
+        assert_eq!(
+            image::guess_format(&capture.bytes).unwrap(),
+            image::ImageFormat::Jpeg
+        );
         assert_eq!((capture.width, capture.height), (320, 180));
         assert_eq!(capture.bytes, jpeg);
         assert!(path.exists());

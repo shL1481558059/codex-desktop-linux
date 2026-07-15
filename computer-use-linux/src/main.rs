@@ -6,11 +6,14 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 mod abs_pointer;
+mod action_verification;
 mod atspi_tree;
+mod capture_transform;
 mod cosmic_helper;
 mod diagnostics;
 mod gnome_extension;
 mod identity;
+mod ocr;
 mod remote_desktop;
 mod screenshot;
 mod server;
@@ -98,13 +101,10 @@ async fn main() -> Result<()> {
                     "height": capture.height,
                     "coordinate_width": capture.coordinate_width,
                     "coordinate_height": capture.coordinate_height,
-                    "scale": capture.scale,
                     "resized": capture.resized,
                     "bytes": capture.bytes,
                     "original_bytes": capture.original_bytes,
                     "max_bytes": capture.max_bytes,
-                    "format": capture.format,
-                    "quality": capture.quality,
                     "data_url_length": capture.data_url.len()
                 }))
                 .context("failed to serialize screenshot report")?

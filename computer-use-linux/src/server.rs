@@ -3,6 +3,9 @@ use crate::atspi_tree::{
     set_element_value, snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
     Bounds, FocusedElementSummary, ValueSetInvocation,
 };
+use crate::capture_transform::{
+    CaptureTransform, DesktopRect, ScreenshotArtifact, ScreenshotArtifactCache, WindowSnapshot,
+};
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
 use crate::remote_desktop::{
@@ -13,7 +16,8 @@ use crate::remote_desktop::{
 };
 use crate::screenshot::{
     capture_screenshot_raw, prepare_screenshot_payload, RawScreenshotCapture, ScreenshotCapture,
-    ScreenshotOutputFormat, ScreenshotPayloadOptions,
+    ScreenshotEncodingPolicy, ScreenshotPayloadOptions, MAX_SCREENSHOT_JPEG_QUALITY,
+    MIN_SCREENSHOT_JPEG_QUALITY,
 };
 use crate::windowing::registry;
 use crate::windows::{
@@ -30,7 +34,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     future::Future,
     os::unix::net::{UnixDatagram, UnixStream},
@@ -72,23 +76,13 @@ pub struct ComputerUseLinux {
     /// Cached logical desktop size (union of monitors) from the most recent
     /// full-frame capture; used for off-screen window/coordinate warnings.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
-    /// Mapping from pixels in the most recently returned screenshot payload to
-    /// physical desktop coordinates accepted by pointer input backends.
-    last_screenshot_coordinates: Arc<Mutex<Option<ScreenshotCoordinateMap>>>,
+    /// Immutable recent screenshots and their capture-to-desktop transforms.
+    /// Multiple IDs remain usable until their bounded TTL expires.
+    screenshot_artifacts: Arc<Mutex<ScreenshotArtifactCache>>,
+    visual_targets: Arc<Mutex<VisualTargetCache>>,
     /// Mapping from cached AT-SPI logical coordinates to the physical X11
     /// window geometry used by coordinate input fallbacks.
     last_atspi_coordinates: Arc<Mutex<Option<AtspiCoordinateMap>>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ScreenshotCoordinateMap {
-    screenshot_id: String,
-    image_width: u32,
-    image_height: u32,
-    coordinate_width: u32,
-    coordinate_height: u32,
-    origin_x: i32,
-    origin_y: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -98,6 +92,55 @@ struct AtspiCoordinateMap {
     physical_x: i32,
     physical_y: i32,
     scale: f64,
+}
+
+const VISUAL_TARGET_LIMIT: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+struct ImageBounds {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl ImageBounds {
+    fn center(self) -> (i32, i32) {
+        (
+            self.x.saturating_add((self.width / 2) as i32),
+            self.y.saturating_add((self.height / 2) as i32),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VisualTarget {
+    target_id: String,
+    screenshot_id: String,
+    bounds: ImageBounds,
+    recognized_text: String,
+    role: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct VisualTargetCache {
+    targets: VecDeque<VisualTarget>,
+}
+
+impl VisualTargetCache {
+    fn insert(&mut self, target: VisualTarget) {
+        self.targets
+            .retain(|existing| existing.target_id != target.target_id);
+        self.targets.push_front(target);
+        self.targets.truncate(VISUAL_TARGET_LIMIT);
+    }
+
+    fn get(&self, target_id: &str) -> Option<VisualTarget> {
+        self.targets
+            .iter()
+            .find(|target| target.target_id == target_id)
+            .cloned()
+    }
 }
 
 #[tool_router]
@@ -265,7 +308,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get a size-bounded screenshot with a unique screenshot_id plus accessibility state for a Linux app. Use the default PNG on the first call and omit format/quality unless compression is necessary. Tool arguments must be strict JSON; JPEG must be written as the string value \"jpeg\", for example {\"format\":\"jpeg\",\"quality\":70}.",
+        description = "Start an app use session if needed, then get accessibility state plus a size-bounded screenshot for a Linux app. Describe the required payload using max_bytes, max_width, and max_height; the backend preserves PNG when possible and compresses automatically when necessary.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
@@ -286,27 +329,43 @@ impl ComputerUseLinux {
         let max_depth = params.max_depth.unwrap_or(12).min(12);
         let include_screenshot = params.include_screenshot.unwrap_or(true);
         let screenshot_options = params.screenshot_options();
+        let window_target_requested = params.window_target().has_target();
         let app_filter = self
             .resolve_accessibility_app_filter(&params, window_context.as_ref())
             .await;
         let (screenshot, screenshot_error) = if include_screenshot {
-            match capture_screenshot_raw().await {
-                Ok(raw) => {
-                    self.cache_desktop_size(raw.width, raw.height);
-                    match prepare_screenshot_payload(raw, screenshot_options) {
-                        Ok(capture) => {
-                            self.cache_screenshot_coordinates(&capture);
-                            (Some(capture), None)
-                        }
-                        Err(error) => {
-                            self.clear_screenshot_coordinates();
-                            (None, Some(format!("{error:#}")))
+            if window_target_requested && window_context.is_none() {
+                (
+                    None,
+                    Some(
+                        "targeted get_app_state could not resolve the requested window; refusing to return an unrelated full-desktop screenshot"
+                            .to_string(),
+                    ),
+                )
+            } else {
+                match capture_screenshot_raw().await {
+                    Ok(raw) => {
+                        self.cache_desktop_size(raw.width, raw.height);
+                        let layout_fingerprint =
+                            self.monitor_layout_fingerprint(raw.width, raw.height).await;
+                        let prepared = prepare_get_app_state_capture(
+                            raw,
+                            window_context.as_ref().filter(|_| window_target_requested),
+                            screenshot_options,
+                        );
+                        match prepared {
+                            Ok((capture, window)) => {
+                                self.cache_screenshot_artifact(
+                                    &capture,
+                                    layout_fingerprint,
+                                    window,
+                                );
+                                (Some(capture), None)
+                            }
+                            Err(error) => (None, Some(error)),
                         }
                     }
-                }
-                Err(error) => {
-                    self.clear_screenshot_coordinates();
-                    (None, Some(format!("{error:#}")))
+                    Err(error) => (None, Some(format!("{error:#}"))),
                 }
             }
         } else {
@@ -404,7 +463,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "screenshot",
-        description = "Capture the screen and return it as a viewable, size-bounded image with a unique screenshot_id. Optionally target a window (window_id/pid/wm_class/title/app_id): unless full_screen=true, the window is raised and strictly cropped before resize; target resolution, bounds, or crop failures return an error instead of a full-screen fallback. Use default PNG unless compression is necessary. Tool arguments must be strict JSON; JPEG must be written as the string value \"jpeg\", for example {\"format\":\"jpeg\",\"quality\":70}.",
+        description = "Capture a viewable, size-bounded image with a unique screenshot_id. Describe the required payload using max_bytes, max_width, and max_height; PNG is preserved when possible and the backend compresses automatically when necessary. A targeted window is strictly cropped unless full_screen=true; crop failures never fall back to the full desktop.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -416,6 +475,474 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.capture_screenshot_tool(params, ScreenshotEncodingPolicy::Adaptive)
+            .await
+    }
+
+    #[tool(
+        name = "screenshot_compressed",
+        description = "Capture a size-bounded JPEG at the exact numeric quality requested. The backend may reduce dimensions to satisfy max_bytes but never changes quality. A targeted window is strictly cropped unless full_screen=true.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn screenshot_compressed(
+        &self,
+        Parameters(params): Parameters<ScreenshotCompressedParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !(MIN_SCREENSHOT_JPEG_QUALITY..=MAX_SCREENSHOT_JPEG_QUALITY).contains(&params.quality) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "quality must be an integer from {MIN_SCREENSHOT_JPEG_QUALITY} to {MAX_SCREENSHOT_JPEG_QUALITY}"
+                ),
+                None,
+            ));
+        }
+        self.capture_screenshot_tool(
+            params.screenshot,
+            ScreenshotEncodingPolicy::Jpeg {
+                quality: params.quality,
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        name = "locate_text",
+        description = "Locate visible text inside an immutable screenshot. Returns screenshot-space bounds and target_id values; use target_id for verified actions instead of manually converting coordinates.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn locate_text(
+        &self,
+        Parameters(params): Parameters<LocateTextParams>,
+    ) -> Json<LocateVisualOutput> {
+        Json(
+            self.locate_visual(&params.screenshot_id, &params.text, None)
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "locate_control",
+        description = "Locate a visible control by role and text inside an immutable screenshot. OCR fallback reports role_inferred=true instead of claiming accessibility evidence.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn locate_control(
+        &self,
+        Parameters(params): Parameters<LocateControlParams>,
+    ) -> Json<LocateVisualOutput> {
+        Json(
+            self.locate_visual(&params.screenshot_id, &params.text, Some(params.role))
+                .await,
+        )
+    }
+
+    async fn locate_visual(
+        &self,
+        screenshot_id: &str,
+        text: &str,
+        role: Option<String>,
+    ) -> LocateVisualOutput {
+        let query = normalize_visual_text(text);
+        if query.is_empty() {
+            return LocateVisualOutput {
+                ok: false,
+                screenshot_id: screenshot_id.to_string(),
+                backend: None,
+                matches: Vec::new(),
+                message: "text must contain at least one non-whitespace character".to_string(),
+            };
+        }
+        let artifact = match self.screenshot_artifact(screenshot_id) {
+            Ok(artifact) => artifact,
+            Err(message) => {
+                return LocateVisualOutput {
+                    ok: false,
+                    screenshot_id: screenshot_id.to_string(),
+                    backend: None,
+                    matches: Vec::new(),
+                    message,
+                };
+            }
+        };
+        let ocr =
+            match crate::ocr::recognize(&artifact.capture.data_url, &artifact.capture.mime_type)
+                .await
+            {
+                Ok(ocr) => ocr,
+                Err(error) => {
+                    return LocateVisualOutput {
+                        ok: false,
+                        screenshot_id: screenshot_id.to_string(),
+                        backend: None,
+                        matches: Vec::new(),
+                        message: format!("OCR failed: {error:#}"),
+                    };
+                }
+            };
+
+        let mut matches = ocr
+            .observations
+            .into_iter()
+            .filter(|observation| normalize_visual_text(&observation.text).contains(&query))
+            .filter_map(|observation| {
+                let raw_bounds = ImageBounds {
+                    x: i32::try_from(observation.bounds.x).ok()?,
+                    y: i32::try_from(observation.bounds.y).ok()?,
+                    width: observation.bounds.width,
+                    height: observation.bounds.height,
+                };
+                let bounds = expand_visual_bounds(
+                    raw_bounds,
+                    artifact.capture.width,
+                    artifact.capture.height,
+                    role.as_deref(),
+                )?;
+                let target_id = new_visual_target_id().ok()?;
+                let target = VisualTarget {
+                    target_id: target_id.clone(),
+                    screenshot_id: screenshot_id.to_string(),
+                    bounds,
+                    recognized_text: observation.text.clone(),
+                    role: role.clone(),
+                };
+                self.visual_targets.lock().ok()?.insert(target);
+                let (center_x, center_y) = bounds.center();
+                Some(LocatedVisualMatch {
+                    target_id,
+                    screenshot_id: screenshot_id.to_string(),
+                    bounds,
+                    center_x,
+                    center_y,
+                    confidence: observation.confidence,
+                    source: if role.is_some() {
+                        "ocr_text_region".to_string()
+                    } else {
+                        "ocr".to_string()
+                    },
+                    recognized_text: observation.text,
+                    role: role.clone(),
+                    role_inferred: role.is_some(),
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .confidence
+                .total_cmp(&left.confidence)
+                .then_with(|| left.bounds.y.cmp(&right.bounds.y))
+                .then_with(|| left.bounds.x.cmp(&right.bounds.x))
+        });
+        matches.truncate(20);
+        let message = match matches.len() {
+            0 => format!("No OCR text matched {text:?}. Capture a clearer or larger screenshot."),
+            1 => "Found one unique visual target.".to_string(),
+            count => format!(
+                "Found {count} candidates. Do not choose by coordinates alone; inspect recognized_text and confidence."
+            ),
+        };
+        LocateVisualOutput {
+            ok: true,
+            screenshot_id: screenshot_id.to_string(),
+            backend: Some(ocr.backend),
+            matches,
+            message,
+        }
+    }
+
+    #[tool(
+        name = "click_target",
+        description = "Click a target_id returned by locate_text or locate_control and require visible target-region change. The action is never automatically repeated after dispatch.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn click_target(
+        &self,
+        Parameters(params): Parameters<ClickTargetParams>,
+    ) -> Json<ClickVerificationOutput> {
+        Json(
+            self.click_visual_target(ClickAndVerifyParams {
+                target_id: params.target_id,
+                button: params.button,
+                click_count: params.click_count,
+                expect_text_present: None,
+                expect_text_absent: None,
+                expect_region_changed: Some(true),
+                expect_focused_editable: None,
+                timeout_ms: None,
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "click_and_verify",
+        description = "Click a target_id and verify all requested postconditions using pointer position, screenshot-region change, OCR text, and focused-editable state. If dispatch occurred but verification fails, the backend returns dispatched_unverified and never clicks again automatically.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn click_and_verify(
+        &self,
+        Parameters(params): Parameters<ClickAndVerifyParams>,
+    ) -> Json<ClickVerificationOutput> {
+        Json(self.click_visual_target(params).await)
+    }
+
+    async fn click_visual_target(&self, params: ClickAndVerifyParams) -> ClickVerificationOutput {
+        let target = match self.visual_target(&params.target_id) {
+            Ok(target) => target,
+            Err(message) => return rejected_click_verification(&params.target_id, message),
+        };
+        let artifact = match self.screenshot_artifact(&target.screenshot_id) {
+            Ok(artifact) => artifact,
+            Err(message) => return rejected_click_verification(&params.target_id, message),
+        };
+        let (center_x, center_y) = target.bounds.center();
+        let right = target
+            .bounds
+            .x
+            .saturating_add(target.bounds.width.saturating_sub(1) as i32);
+        let bottom = target
+            .bounds
+            .y
+            .saturating_add(target.bounds.height.saturating_sub(1) as i32);
+        let mapped = match self
+            .resolve_screenshot_points(
+                &target.screenshot_id,
+                &[
+                    (center_x, center_y),
+                    (target.bounds.x, target.bounds.y),
+                    (right, bottom),
+                ],
+            )
+            .await
+        {
+            Ok(points) => points,
+            Err(message) => return rejected_click_verification(&params.target_id, message),
+        };
+        let received = Some(serde_json::json!(params.clone()));
+        let action = self
+            .execute_click(
+                ClickParams {
+                    x: Some(mapped[0].0),
+                    y: Some(mapped[0].1),
+                    button: params.button.clone(),
+                    click_count: params.click_count,
+                    ..Default::default()
+                },
+                received,
+            )
+            .await
+            .0;
+        if !action.dispatched {
+            return ClickVerificationOutput {
+                ok: false,
+                stage: "rejected".to_string(),
+                dispatched: false,
+                landed: action.landed,
+                verified: action.verified,
+                target_id: params.target_id,
+                screenshot_id: Some(target.screenshot_id),
+                pointer_arrived: None,
+                actual_pointer_x: None,
+                actual_pointer_y: None,
+                region_change_score: None,
+                region_changed: None,
+                expected_text_present: None,
+                expected_text_absent: None,
+                focused_editable: None,
+                evidence_screenshot_id: None,
+                message: action.message,
+            };
+        }
+
+        let actual_pointer = if self.is_x11_session() {
+            query_x11_pointer_position().ok()
+        } else {
+            None
+        };
+        let pointer_arrived = actual_pointer.map(|(x, y)| {
+            let left = mapped[1].0.min(mapped[2].0);
+            let top = mapped[1].1.min(mapped[2].1);
+            let right = mapped[1].0.max(mapped[2].0);
+            let bottom = mapped[1].1.max(mapped[2].1);
+            x >= left && x <= right && y >= top && y <= bottom
+        });
+        let require_region = params.expect_region_changed.unwrap_or(
+            params.expect_text_present.is_none()
+                && params.expect_text_absent.is_none()
+                && params.expect_focused_editable.is_none(),
+        );
+        let timeout_ms = params.timeout_ms.unwrap_or(2000).clamp(250, 5000);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut last_score = None;
+        let mut last_region_changed = None;
+        let mut last_text_present = None;
+        let mut last_text_absent = None;
+        let mut last_focused_editable = None;
+        let mut evidence_screenshot_id = None;
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            let evidence = match self.capture_evidence_for_artifact(&artifact).await {
+                Ok(capture) => capture,
+                Err(error) => {
+                    if Instant::now() >= deadline {
+                        return dispatched_unverified(
+                            &params,
+                            &target,
+                            pointer_arrived,
+                            actual_pointer,
+                            last_score,
+                            last_region_changed,
+                            last_text_present,
+                            last_text_absent,
+                            last_focused_editable,
+                            evidence_screenshot_id,
+                            format!(
+                                "Post-click capture failed: {error}. The click was not repeated."
+                            ),
+                        );
+                    }
+                    continue;
+                }
+            };
+            evidence_screenshot_id = Some(evidence.screenshot_id.clone());
+            let region = crate::action_verification::PixelRegion {
+                x: target.bounds.x.max(0) as u32,
+                y: target.bounds.y.max(0) as u32,
+                width: target.bounds.width,
+                height: target.bounds.height,
+            };
+            if let Ok(score) = crate::action_verification::region_change_score(
+                &artifact.capture.data_url,
+                &evidence.data_url,
+                region,
+            ) {
+                last_score = Some(score);
+                last_region_changed = Some(score >= 0.02);
+            }
+
+            if params.expect_text_present.is_some() || params.expect_text_absent.is_some() {
+                if let Ok(result) =
+                    crate::ocr::recognize(&evidence.data_url, &evidence.mime_type).await
+                {
+                    let visible_text = normalize_visual_text(
+                        &result
+                            .observations
+                            .iter()
+                            .map(|observation| observation.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                    last_text_present = params
+                        .expect_text_present
+                        .as_ref()
+                        .map(|expected| visible_text.contains(&normalize_visual_text(expected)));
+                    last_text_absent = params
+                        .expect_text_absent
+                        .as_ref()
+                        .map(|expected| !visible_text.contains(&normalize_visual_text(expected)));
+                }
+            }
+            if params.expect_focused_editable.is_some() {
+                last_focused_editable =
+                    timeout(Duration::from_millis(1500), focused_element_summary(None))
+                        .await
+                        .ok()
+                        .and_then(std::result::Result::ok)
+                        .flatten()
+                        .map(|element| element.editable);
+            }
+
+            let region_ok = if params.expect_region_changed.is_some() || require_region {
+                last_region_changed == Some(require_region)
+            } else {
+                true
+            };
+            let text_present_ok =
+                params.expect_text_present.is_none() || last_text_present == Some(true);
+            let text_absent_ok =
+                params.expect_text_absent.is_none() || last_text_absent == Some(true);
+            let focus_ok = match params.expect_focused_editable {
+                Some(expected) => last_focused_editable == Some(expected),
+                None => true,
+            };
+            let pointer_ok = pointer_arrived != Some(false);
+            if region_ok && text_present_ok && text_absent_ok && focus_ok && pointer_ok {
+                return ClickVerificationOutput {
+                    ok: true,
+                    stage: "verified".to_string(),
+                    dispatched: true,
+                    landed: Some(true),
+                    verified: true,
+                    target_id: params.target_id,
+                    screenshot_id: Some(target.screenshot_id),
+                    pointer_arrived,
+                    actual_pointer_x: actual_pointer.map(|point| point.0),
+                    actual_pointer_y: actual_pointer.map(|point| point.1),
+                    region_change_score: last_score,
+                    region_changed: last_region_changed,
+                    expected_text_present: last_text_present,
+                    expected_text_absent: last_text_absent,
+                    focused_editable: last_focused_editable,
+                    evidence_screenshot_id,
+                    message: format!(
+                        "Click verified for {:?}{}.",
+                        target.recognized_text,
+                        target
+                            .role
+                            .as_deref()
+                            .map(|role| format!(" ({role})"))
+                            .unwrap_or_default()
+                    ),
+                };
+            }
+            if Instant::now() >= deadline {
+                return dispatched_unverified(
+                    &params,
+                    &target,
+                    pointer_arrived,
+                    actual_pointer,
+                    last_score,
+                    last_region_changed,
+                    last_text_present,
+                    last_text_absent,
+                    last_focused_editable,
+                    evidence_screenshot_id,
+                    "The click was dispatched but the requested evidence did not converge before timeout. The click was not repeated. Capture and locate again before deciding whether another click is safe."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    async fn capture_screenshot_tool(
+        &self,
+        params: ScreenshotParams,
+        encoding: ScreenshotEncodingPolicy,
+    ) -> Result<CallToolResult, ErrorData> {
         let target = params.window_target();
 
         // When targeting a window, raise it first (so it isn't occluded) and
@@ -424,6 +951,7 @@ impl ComputerUseLinux {
         // into an apparently successful full-desktop screenshot.
         let mut crop: Option<crate::windowing::WindowBounds> = None;
         let mut window_label: Option<String> = None;
+        let mut captured_window: Option<WindowSnapshot> = None;
         if let Some(target) = &target {
             if params.raise_window.unwrap_or(true) {
                 let focus = focus_window_target(target).await.map_err(|error| {
@@ -475,6 +1003,7 @@ impl ComputerUseLinux {
                     )
                 })?);
                 window_label = window.title.clone();
+                captured_window = window_snapshot(window);
             }
         }
 
@@ -482,6 +1011,9 @@ impl ComputerUseLinux {
             .await
             .map_err(|e| ErrorData::internal_error(format!("screenshot failed: {e}"), None))?;
         self.cache_desktop_size(raw_capture.width, raw_capture.height);
+        let layout_fingerprint = self
+            .monitor_layout_fingerprint(raw_capture.width, raw_capture.height)
+            .await;
 
         // Warn when the target window extends past the visible desktop. The
         // strict crop below returns only the visible intersection and reports
@@ -522,7 +1054,6 @@ impl ComputerUseLinux {
                 }
                 (
                     RawScreenshotCapture {
-                        mime_type: "image/png".to_string(),
                         bytes,
                         source: raw_capture.source.clone(),
                         width,
@@ -533,7 +1064,7 @@ impl ComputerUseLinux {
             }
             None => (raw_capture, false),
         };
-        let mut capture = prepare_screenshot_payload(capture, params.screenshot_options())
+        let mut capture = prepare_screenshot_payload(capture, params.screenshot_options(encoding))
             .map_err(|e| {
                 ErrorData::internal_error(format!("screenshot resize failed: {e}"), None)
             })?;
@@ -542,8 +1073,10 @@ impl ComputerUseLinux {
                 capture.coordinate_origin_x = rect.x;
                 capture.coordinate_origin_y = rect.y;
             }
+            capture.cropped_to_window = true;
+            capture.target_window_id = captured_window.map(|window| window.window_id);
         }
-        self.cache_screenshot_coordinates(&capture);
+        self.cache_screenshot_artifact(&capture, layout_fingerprint, captured_window);
 
         let mut caption = serde_json::json!({
             "screenshot_id": capture.screenshot_id.clone(),
@@ -553,18 +1086,17 @@ impl ComputerUseLinux {
             "coordinate_height": capture.coordinate_height,
             "coordinate_origin_x": capture.coordinate_origin_x,
             "coordinate_origin_y": capture.coordinate_origin_y,
-            "scale": capture.scale,
             "resized": capture.resized,
             "bytes": capture.bytes,
             "original_bytes": capture.original_bytes,
             "max_bytes": capture.max_bytes,
-            "format": capture.format,
-            "quality": capture.quality,
+            "mime_type": capture.mime_type,
             "source": capture.source,
-            "cropped_to_window": cropped,
+            "cropped_to_window": capture.cropped_to_window,
+            "target_window_id": capture.target_window_id,
             "window_title": window_label,
             "coordinate_space": "screenshot",
-            "coordinate_usage": "Pass x/y and screenshot_id from this returned image with coordinate_space=screenshot; the backend rejects missing or stale IDs and converts resize and crop offsets to desktop pixels.",
+            "coordinate_usage": "Pass image x/y and this screenshot_id to click_screenshot, scroll_screenshot, or drag_screenshot. Never copy image pixels into a desktop-coordinate tool.",
         });
         if let Some(note) = off_screen_note {
             caption["window_off_screen"] = serde_json::json!(true);
@@ -641,7 +1173,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index, semantic selector, or coordinates. For a point chosen from a get_app_state/screenshot image, pass coordinate_space=\"screenshot\" plus that image's screenshot_id so resize and crop offsets are converted automatically; missing or stale IDs are rejected. desktop remains the backward-compatible default.",
+        description = "Click an accessibility element by index or semantic selector. Use click_screenshot for a point selected from an image, or click_desktop for an already-physical desktop point.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -649,40 +1181,86 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn click(&self, Parameters(mut params): Parameters<ClickParams>) -> Json<ActionOutput> {
+    async fn click(
+        &self,
+        Parameters(params): Parameters<SemanticClickParams>,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        if params.coordinate_space == CoordinateSpace::Screenshot && params.relative == Some(true) {
-            return Json(ActionOutput {
-                dispatched: false,
-                landed: None,
-                verified: false,
-                ok: false,
-                implemented: true,
-                action: "click".to_string(),
-                message: "coordinate_space=screenshot already includes the screenshot crop origin and cannot be combined with relative=true."
-                    .to_string(),
+        self.execute_click(params.into(), received).await
+    }
+
+    #[tool(
+        name = "click_desktop",
+        description = "Click an explicit physical desktop pixel. Coordinates must not come from a resized or cropped screenshot; use click_screenshot for image pixels.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn click_desktop(
+        &self,
+        Parameters(params): Parameters<DesktopClickParams>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        self.execute_click(params.into(), received).await
+    }
+
+    #[tool(
+        name = "click_screenshot",
+        description = "Click a pixel from the exact screenshot identified by screenshot_id. The backend validates capture age, monitor layout, and target-window geometry before converting the point to desktop pixels.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn click_screenshot(
+        &self,
+        Parameters(params): Parameters<ScreenshotClickParams>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        let points = match self
+            .resolve_screenshot_points(&params.screenshot_id, &[(params.x, params.y)])
+            .await
+        {
+            Ok(points) => points,
+            Err(message) => return Json(rejected_action("click", message, received)),
+        };
+        let (x, y) = points[0];
+        let mut output = self
+            .execute_click(
+                ClickParams {
+                    x: Some(x),
+                    y: Some(y),
+                    button: params.button,
+                    click_count: params.click_count,
+                    ..Default::default()
+                },
                 received,
-            });
+            )
+            .await;
+        if output.0.dispatched && self.is_x11_session() {
+            if let Ok((actual_x, actual_y)) = query_x11_pointer_position() {
+                let arrived = actual_x == x && actual_y == y;
+                output.0.landed = Some(arrived);
+                output.0.verified = true;
+                output.0.ok &= arrived;
+                output.0.message.push_str(&format!(
+                    " Pointer verification: expected {x},{y}, actual {actual_x},{actual_y}."
+                ));
+            }
         }
-        let coordinate_space = params.coordinate_space;
-        let screenshot_id = params.screenshot_id.clone();
-        if let Err(message) = self.translate_explicit_point(
-            &mut params.x,
-            &mut params.y,
-            coordinate_space,
-            screenshot_id.as_deref(),
-        ) {
-            return Json(ActionOutput {
-                dispatched: false,
-                landed: None,
-                verified: false,
-                ok: false,
-                implemented: true,
-                action: "click".to_string(),
-                message,
-                received,
-            });
-        }
+        output
+    }
+
+    async fn execute_click(
+        &self,
+        mut params: ClickParams,
+        received: Option<serde_json::Value>,
+    ) -> Json<ActionOutput> {
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
         let window_target = params.window_target();
@@ -1054,7 +1632,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "scroll",
-        description = "Scroll an element in a direction by a number of pages. For a point chosen from a screenshot image, pass coordinate_space=\"screenshot\" plus that image's screenshot_id; missing or stale IDs are rejected. With a window target and no x/y/element_index, scrolls at the centre of the targeted window.",
+        description = "Scroll at a cached accessibility element, or at the current pointer when element_index is omitted. Use scroll_screenshot or scroll_desktop for explicit visual points.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1062,40 +1640,79 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn scroll(&self, Parameters(mut params): Parameters<ScrollParams>) -> Json<ActionOutput> {
+    async fn scroll(
+        &self,
+        Parameters(params): Parameters<SemanticScrollParams>,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        if params.coordinate_space == CoordinateSpace::Screenshot && params.relative == Some(true) {
-            return Json(ActionOutput {
-                dispatched: false,
-                landed: None,
-                verified: false,
-                ok: false,
-                implemented: true,
-                action: "scroll".to_string(),
-                message: "coordinate_space=screenshot already includes the screenshot crop origin and cannot be combined with relative=true."
-                    .to_string(),
-                received,
-            });
-        }
-        let coordinate_space = params.coordinate_space;
-        let screenshot_id = params.screenshot_id.clone();
-        if let Err(message) = self.translate_explicit_point(
-            &mut params.x,
-            &mut params.y,
-            coordinate_space,
-            screenshot_id.as_deref(),
-        ) {
-            return Json(ActionOutput {
-                dispatched: false,
-                landed: None,
-                verified: false,
-                ok: false,
-                implemented: true,
-                action: "scroll".to_string(),
-                message,
-                received,
-            });
-        }
+        self.execute_scroll(params.into(), received).await
+    }
+
+    #[tool(
+        name = "scroll_desktop",
+        description = "Scroll at an explicit physical desktop pixel. Use scroll_screenshot when the point came from an image.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn scroll_desktop(
+        &self,
+        Parameters(params): Parameters<DesktopScrollParams>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        self.execute_scroll(params.into(), received).await
+    }
+
+    #[tool(
+        name = "scroll_screenshot",
+        description = "Scroll at a pixel from the exact screenshot identified by screenshot_id after validating the capture context.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn scroll_screenshot(
+        &self,
+        Parameters(params): Parameters<ScreenshotScrollParams>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        let points = match self
+            .resolve_screenshot_points(&params.screenshot_id, &[(params.x, params.y)])
+            .await
+        {
+            Ok(points) => points,
+            Err(message) => return Json(rejected_action("scroll", message, received)),
+        };
+        let (x, y) = points[0];
+        self.execute_scroll(
+            ScrollParams {
+                element_index: None,
+                x: Some(x),
+                y: Some(y),
+                direction: params.direction,
+                pages: params.pages,
+                window_id: None,
+                pid: None,
+                app_id: None,
+                wm_class: None,
+                window_title: None,
+                relative: None,
+            },
+            received,
+        )
+        .await
+    }
+
+    async fn execute_scroll(
+        &self,
+        mut params: ScrollParams,
+        received: Option<serde_json::Value>,
+    ) -> Json<ActionOutput> {
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
         // Raise/focus the target window first (parity with click) so wheel
         // events land on the intended app.
@@ -1323,8 +1940,8 @@ impl ComputerUseLinux {
     }
 
     #[tool(
-        name = "drag",
-        description = "Drag from one point to another. For points chosen from a screenshot image, pass coordinate_space=\"screenshot\" plus that image's screenshot_id so resize and crop offsets are converted automatically; missing or stale IDs are rejected.",
+        name = "drag_desktop",
+        description = "Drag between two explicit physical desktop pixels. Use drag_screenshot when either point came from an image.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1332,33 +1949,68 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn drag(&self, Parameters(mut params): Parameters<DragParams>) -> Json<ActionOutput> {
+    async fn drag_desktop(
+        &self,
+        Parameters(params): Parameters<DesktopDragParams>,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        if params.coordinate_space == CoordinateSpace::Screenshot {
-            let screenshot_id = params.screenshot_id.as_deref();
-            let start =
-                self.screenshot_point_to_desktop(params.start_x, params.start_y, screenshot_id);
-            let end = self.screenshot_point_to_desktop(params.end_x, params.end_y, screenshot_id);
-            let ((start_x, start_y), (end_x, end_y)) = match (start, end) {
-                (Ok(start), Ok(end)) => (start, end),
-                (Err(message), _) | (_, Err(message)) => {
-                    return Json(ActionOutput {
-                        dispatched: false,
-                        landed: None,
-                        verified: false,
-                        ok: false,
-                        implemented: true,
-                        action: "drag".to_string(),
-                        message,
-                        received,
-                    });
-                }
-            };
-            params.start_x = start_x;
-            params.start_y = start_y;
-            params.end_x = end_x;
-            params.end_y = end_y;
-        }
+        self.execute_drag(
+            DragParams {
+                start_x: params.start_x,
+                start_y: params.start_y,
+                end_x: params.end_x,
+                end_y: params.end_y,
+            },
+            received,
+        )
+        .await
+    }
+
+    #[tool(
+        name = "drag_screenshot",
+        description = "Drag between two pixels from the exact screenshot identified by screenshot_id after validating the capture context.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn drag_screenshot(
+        &self,
+        Parameters(params): Parameters<ScreenshotDragParams>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        let points = match self
+            .resolve_screenshot_points(
+                &params.screenshot_id,
+                &[
+                    (params.start_x, params.start_y),
+                    (params.end_x, params.end_y),
+                ],
+            )
+            .await
+        {
+            Ok(points) => points,
+            Err(message) => return Json(rejected_action("drag", message, received)),
+        };
+        self.execute_drag(
+            DragParams {
+                start_x: points[0].0,
+                start_y: points[0].1,
+                end_x: points[1].0,
+                end_y: points[1].1,
+            },
+            received,
+        )
+        .await
+    }
+
+    async fn execute_drag(
+        &self,
+        params: DragParams,
+        received: Option<serde_json::Value>,
+    ) -> Json<ActionOutput> {
         let mut drag_feedback = ActionFeedback::default();
         if let Some(note) = self
             .off_screen_note_for_point(params.start_x, params.start_y)
@@ -1820,7 +2472,11 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.3.1-linux-alpha1",
+    /* Historical instructions retained in this comment until the next plugin
+     * cache-breaking release; the active contract follows below.
     instructions = "Begin every turn that uses Computer Use by calling get_app_state with only the needed app/window selectors; keep the first call on the default PNG and omit format/quality. Tool arguments must always be strict JSON. Enum values such as jpeg and png are JSON strings: use {\"format\":\"jpeg\",\"quality\":70}, never a bare value such as {\"format\":jpeg}. If a tool call reports a JSON argument parse error, retry it once with strict JSON instead of ending the task. If diagnostics report disabled accessibility on GNOME, call setup_accessibility before asking the user to retry. If AT-SPI is unavailable on a non-GNOME desktop such as Deepin, do not repeatedly call setup_accessibility; continue with screenshots and coordinate input when readiness confirms an input backend. Use list_windows/focused_window before targeted keyboard input when window introspection is available. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send exact window focus plus pointer/keyboard input through xdotool on X11, paste exact X11 text through a verified system-clipboard transaction, send coordinate or element-targeted input through the Wayland remote desktop portal when available, and use ydotool as a fallback. Action results separate dispatched (the backend sent the action), landed (target-level evidence, or null when unknown), and verified (whether the landing conclusion has conclusive post-action evidence); treat landed=false as failure even when dispatched=true. Screenshot results include a unique screenshot_id, width/height for the returned image, coordinate_width/coordinate_height, coordinate origin, and scale metadata. For every point selected visually from a returned image, pass coordinate_space=\"screenshot\" and the screenshot_id from that same image to click, scroll, or drag so resize and crop offsets are converted automatically; missing and stale IDs are rejected, and desktop is only for already-physical desktop pixels. A later image replaces the cached mapping, so coordinates and screenshot_id must always come from the same result. A targeted screenshot without full_screen=true is strict: target resolution, bounds, and crop failures return errors rather than silently returning the whole desktop. Request more detail with max_width, max_height, max_bytes, a strict JSON format string, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. Plain left clicks prefer native AT-SPI actions, and scaled X11 coordinate fallbacks are aligned to the physical target window. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable); a conclusively non-editable target returns landed=false and ok=false instead of reporting a false success. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+     */
+    instructions = "Begin a Computer Use task with get_app_state using only the required app or window selectors. Ordinary screenshots accept max_bytes, max_width, and max_height only: the backend prefers PNG and compresses automatically. Use screenshot_compressed only when JPEG with an explicit numeric quality is required. Never convert image coordinates manually or pass them to a desktop-coordinate tool. Use click_screenshot, scroll_screenshot, and drag_screenshot with the screenshot_id from the exact image; the backend rejects expired captures and changed monitor or window geometry. Use click_desktop, scroll_desktop, and drag_desktop only for coordinates already known to be physical desktop pixels. Prefer accessibility element_index or semantic selectors when available. A targeted screenshot is strictly cropped and never falls back to the full desktop. Tool arguments must be strict JSON. Do not invoke xdotool or ydotool through a shell; all input must go through these Computer Use tools. Treat dispatched, landed, and verified as separate states and stop when a dispatched action cannot be verified. get_app_state returns compact diagnostics by default; use verbose=true only when diagnosing integration failures. Electron applications require --force-renderer-accessibility for a useful AT-SPI tree.",
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -1990,16 +2646,6 @@ struct GetAppStateParams {
     /// Maximum returned screenshot image bytes before base64 (default 2 MiB, hard-capped).
     #[serde(default)]
     max_bytes: Option<usize>,
-    /// Additional downscale factor from 0.0 to 1.0, applied before max dimensions.
-    #[serde(default)]
-    scale: Option<f32>,
-    /// Output image format (default png). JSON callers must quote "jpeg" or "png".
-    #[serde(default)]
-    format: Option<ScreenshotOutputFormat>,
-    /// JPEG quality from 1 to 95 (default 80). Ignored for png.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 95))]
-    quality: Option<u8>,
     /// Include the full diagnostics report (large). Default false: only the
     /// compact readiness block is returned.
     #[serde(default)]
@@ -2026,9 +2672,7 @@ impl GetAppStateParams {
             max_width: self.max_width,
             max_height: self.max_height,
             max_bytes: self.max_bytes,
-            scale: self.scale,
-            format: self.format,
-            quality: self.quality,
+            encoding: ScreenshotEncodingPolicy::Adaptive,
         }
     }
 }
@@ -2061,16 +2705,6 @@ struct ScreenshotParams {
     /// Maximum returned screenshot image bytes before base64 (default 2 MiB, hard-capped).
     #[serde(default)]
     max_bytes: Option<usize>,
-    /// Additional downscale factor from 0.0 to 1.0, applied before max dimensions.
-    #[serde(default)]
-    scale: Option<f32>,
-    /// Output image format (default png). JSON callers must quote "jpeg" or "png".
-    #[serde(default)]
-    format: Option<ScreenshotOutputFormat>,
-    /// JPEG quality from 1 to 95 (default 80). Ignored for png.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 95))]
-    quality: Option<u8>,
 }
 
 impl ScreenshotParams {
@@ -2096,16 +2730,111 @@ impl ScreenshotParams {
         })
     }
 
-    fn screenshot_options(&self) -> ScreenshotPayloadOptions {
+    fn screenshot_options(&self, encoding: ScreenshotEncodingPolicy) -> ScreenshotPayloadOptions {
         ScreenshotPayloadOptions {
             max_width: self.max_width,
             max_height: self.max_height,
             max_bytes: self.max_bytes,
-            scale: self.scale,
-            format: self.format,
-            quality: self.quality,
+            encoding,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct ScreenshotCompressedParams {
+    #[serde(flatten)]
+    screenshot: ScreenshotParams,
+    /// JPEG quality. The output is always JPEG; dimensions are reduced when
+    /// necessary to satisfy max_bytes without changing this value.
+    #[schemars(range(min = 1, max = 95))]
+    quality: u8,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct LocateTextParams {
+    screenshot_id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct LocateControlParams {
+    screenshot_id: String,
+    role: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct LocatedVisualMatch {
+    target_id: String,
+    screenshot_id: String,
+    bounds: ImageBounds,
+    center_x: i32,
+    center_y: i32,
+    confidence: f64,
+    source: String,
+    recognized_text: String,
+    role: Option<String>,
+    role_inferred: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct LocateVisualOutput {
+    ok: bool,
+    screenshot_id: String,
+    backend: Option<String>,
+    matches: Vec<LocatedVisualMatch>,
+    message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct ClickTargetParams {
+    target_id: String,
+    #[serde(default)]
+    button: Option<String>,
+    #[serde(default)]
+    click_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct ClickAndVerifyParams {
+    target_id: String,
+    #[serde(default)]
+    button: Option<String>,
+    #[serde(default)]
+    click_count: Option<u32>,
+    #[serde(default)]
+    expect_text_present: Option<String>,
+    #[serde(default)]
+    expect_text_absent: Option<String>,
+    #[serde(default)]
+    expect_region_changed: Option<bool>,
+    #[serde(default)]
+    expect_focused_editable: Option<bool>,
+    /// Total verification window. Clamped to 250-5000 ms.
+    #[serde(default)]
+    #[schemars(range(min = 250, max = 5000))]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ClickVerificationOutput {
+    ok: bool,
+    stage: String,
+    dispatched: bool,
+    landed: Option<bool>,
+    verified: bool,
+    target_id: String,
+    screenshot_id: Option<String>,
+    pointer_arrived: Option<bool>,
+    actual_pointer_x: Option<i32>,
+    actual_pointer_y: Option<i32>,
+    region_change_score: Option<f64>,
+    region_changed: Option<bool>,
+    expected_text_present: Option<bool>,
+    expected_text_absent: Option<bool>,
+    focused_editable: Option<bool>,
+    evidence_screenshot_id: Option<String>,
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -2153,6 +2882,45 @@ fn get_app_state_call_result(
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+struct SemanticClickParams {
+    #[serde(default)]
+    element_index: Option<u32>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    states: Vec<String>,
+    #[serde(default)]
+    button: Option<String>,
+    #[serde(default)]
+    click_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct DesktopClickParams {
+    x: i32,
+    y: i32,
+    #[serde(default)]
+    button: Option<String>,
+    #[serde(default)]
+    click_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct ScreenshotClickParams {
+    screenshot_id: String,
+    x: i32,
+    y: i32,
+    #[serde(default)]
+    button: Option<String>,
+    #[serde(default)]
+    click_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct ClickParams {
     #[serde(default)]
     element_index: Option<u32>,
@@ -2185,21 +2953,37 @@ struct ClickParams {
     wm_class: Option<String>,
     #[serde(default)]
     window_title: Option<String>,
-    /// Interpret physical desktop `x`/`y` as relative to the targeted window's
-    /// top-left corner. For pixels selected from a resized/cropped screenshot,
-    /// use coordinate_space=screenshot instead. Requires a window target.
+    /// Interpret explicit physical desktop `x`/`y` as relative to the targeted
+    /// window's top-left corner. Internal compatibility path only.
     #[serde(default)]
     relative: Option<bool>,
-    /// Coordinate system used by explicit x/y values. `desktop` (default)
-    /// accepts physical desktop pixels. `screenshot` accepts pixels from the
-    /// a returned get_app_state/screenshot image and converts them using its
-    /// resize and crop metadata. screenshot_id must identify that same image.
-    #[serde(default)]
-    coordinate_space: CoordinateSpace,
-    /// Opaque ID returned with the screenshot supplying x/y. Required when
-    /// coordinate_space is screenshot and must match the latest capture.
-    #[serde(default)]
-    screenshot_id: Option<String>,
+}
+
+impl From<SemanticClickParams> for ClickParams {
+    fn from(params: SemanticClickParams) -> Self {
+        Self {
+            element_index: params.element_index,
+            role: params.role,
+            name: params.name,
+            text: params.text,
+            states: params.states,
+            button: params.button,
+            click_count: params.click_count,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<DesktopClickParams> for ClickParams {
+    fn from(params: DesktopClickParams) -> Self {
+        Self {
+            x: Some(params.x),
+            y: Some(params.y),
+            button: params.button,
+            click_count: params.click_count,
+            ..Default::default()
+        }
+    }
 }
 
 impl ClickParams {
@@ -2294,6 +3078,34 @@ impl SetValueParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct SemanticScrollParams {
+    #[serde(default)]
+    element_index: Option<u32>,
+    direction: String,
+    #[serde(default)]
+    pages: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct DesktopScrollParams {
+    x: i32,
+    y: i32,
+    direction: String,
+    #[serde(default)]
+    pages: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct ScreenshotScrollParams {
+    screenshot_id: String,
+    x: i32,
+    y: i32,
+    direction: String,
+    #[serde(default)]
+    pages: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ScrollParams {
     #[serde(default)]
     element_index: Option<u32>,
@@ -2316,18 +3128,46 @@ struct ScrollParams {
     wm_class: Option<String>,
     #[serde(default)]
     window_title: Option<String>,
-    /// Interpret physical desktop `x`/`y` as relative to the targeted window's
-    /// top-left corner. For pixels selected from a resized/cropped screenshot,
-    /// use coordinate_space=screenshot instead. Requires a window target.
+    /// Interpret explicit physical desktop `x`/`y` as relative to the targeted
+    /// window's top-left corner. Internal compatibility path only.
     #[serde(default)]
     relative: Option<bool>,
-    /// Coordinate system used by explicit x/y values. See click.
-    #[serde(default)]
-    coordinate_space: CoordinateSpace,
-    /// Opaque ID returned with the screenshot supplying x/y. Required when
-    /// coordinate_space is screenshot and must match the latest capture.
-    #[serde(default)]
-    screenshot_id: Option<String>,
+}
+
+impl From<SemanticScrollParams> for ScrollParams {
+    fn from(params: SemanticScrollParams) -> Self {
+        Self {
+            element_index: params.element_index,
+            x: None,
+            y: None,
+            direction: params.direction,
+            pages: params.pages,
+            window_id: None,
+            pid: None,
+            app_id: None,
+            wm_class: None,
+            window_title: None,
+            relative: None,
+        }
+    }
+}
+
+impl From<DesktopScrollParams> for ScrollParams {
+    fn from(params: DesktopScrollParams) -> Self {
+        Self {
+            element_index: None,
+            x: Some(params.x),
+            y: Some(params.y),
+            direction: params.direction,
+            pages: params.pages,
+            window_id: None,
+            pid: None,
+            app_id: None,
+            wm_class: None,
+            window_title: None,
+            relative: None,
+        }
+    }
 }
 
 impl ScrollParams {
@@ -2356,27 +3196,28 @@ impl ScrollParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct DesktopDragParams {
+    start_x: i32,
+    start_y: i32,
+    end_x: i32,
+    end_y: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct ScreenshotDragParams {
+    screenshot_id: String,
+    start_x: i32,
+    start_y: i32,
+    end_x: i32,
+    end_y: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct DragParams {
     start_x: i32,
     start_y: i32,
     end_x: i32,
     end_y: i32,
-    /// Coordinate system used by all four points. See click.
-    #[serde(default)]
-    coordinate_space: CoordinateSpace,
-    /// Opaque ID returned with the screenshot supplying all four points.
-    /// Required when coordinate_space is screenshot and must match the latest
-    /// capture.
-    #[serde(default)]
-    screenshot_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum CoordinateSpace {
-    #[default]
-    Desktop,
-    Screenshot,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -2721,86 +3562,186 @@ impl ComputerUseLinux {
         }
     }
 
-    fn cache_screenshot_coordinates(&self, capture: &ScreenshotCapture) {
-        let mapping = ScreenshotCoordinateMap {
-            screenshot_id: capture.screenshot_id.clone(),
-            image_width: capture.width,
-            image_height: capture.height,
-            coordinate_width: capture.coordinate_width,
-            coordinate_height: capture.coordinate_height,
-            origin_x: capture.coordinate_origin_x,
-            origin_y: capture.coordinate_origin_y,
+    fn cache_screenshot_artifact(
+        &self,
+        capture: &ScreenshotCapture,
+        monitor_layout_fingerprint: String,
+        window: Option<WindowSnapshot>,
+    ) {
+        let Ok(transform) = CaptureTransform::from_capture(
+            capture,
+            monitor_layout_fingerprint,
+            window,
+            Instant::now(),
+        ) else {
+            return;
         };
-        if let Ok(mut guard) = self.last_screenshot_coordinates.lock() {
-            *guard = Some(mapping);
+        if let Ok(mut guard) = self.screenshot_artifacts.lock() {
+            guard.insert(ScreenshotArtifact {
+                capture: capture.clone(),
+                transform,
+            });
         }
     }
 
-    fn clear_screenshot_coordinates(&self) {
-        if let Ok(mut guard) = self.last_screenshot_coordinates.lock() {
-            *guard = None;
-        }
-    }
-
-    fn screenshot_point_to_desktop(
+    fn screenshot_artifact(
         &self,
-        x: i32,
-        y: i32,
-        screenshot_id: Option<&str>,
-    ) -> std::result::Result<(i32, i32), String> {
-        let mapping = self.screenshot_coordinate_mapping(screenshot_id)?;
-        screenshot_point_to_desktop(&mapping, x, y)
-    }
-
-    fn screenshot_coordinate_mapping(
-        &self,
-        screenshot_id: Option<&str>,
-    ) -> std::result::Result<ScreenshotCoordinateMap, String> {
-        let screenshot_id = screenshot_id.ok_or_else(|| {
-            "screenshot_id is required when coordinate_space=screenshot. Use the ID returned with the screenshot supplying the coordinates."
-                .to_string()
-        })?;
-        let mapping = self
-            .last_screenshot_coordinates
+        screenshot_id: &str,
+    ) -> std::result::Result<ScreenshotArtifact, String> {
+        self.screenshot_artifacts
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .ok_or_else(|| {
-                "No screenshot coordinate mapping is cached. Call get_app_state or screenshot immediately before using coordinate_space=screenshot."
-                    .to_string()
-            })?;
-        if screenshot_id != mapping.screenshot_id {
-            return Err(format!(
-                "screenshot_id {screenshot_id:?} does not match the latest screenshot_id {:?}. Call get_app_state or screenshot again and use coordinates plus screenshot_id from the same returned image.",
-                mapping.screenshot_id
-            ));
-        }
-        Ok(mapping)
+            .map_err(|_| "Screenshot artifact cache is unavailable.".to_string())?
+            .get(screenshot_id, Instant::now())
     }
 
-    fn translate_explicit_point(
+    fn visual_target(&self, target_id: &str) -> std::result::Result<VisualTarget, String> {
+        self.visual_targets
+            .lock()
+            .map_err(|_| "Visual target cache is unavailable.".to_string())?
+            .get(target_id)
+            .ok_or_else(|| {
+                format!("Unknown target_id {target_id:?}. Run locate_text or locate_control again.")
+            })
+    }
+
+    async fn capture_evidence_for_artifact(
         &self,
-        x: &mut Option<i32>,
-        y: &mut Option<i32>,
-        coordinate_space: CoordinateSpace,
-        screenshot_id: Option<&str>,
-    ) -> std::result::Result<(), String> {
-        if coordinate_space == CoordinateSpace::Desktop {
-            return Ok(());
-        }
-        let (point_x, point_y) = match (x.as_ref(), y.as_ref()) {
-            (Some(point_x), Some(point_y)) => (*point_x, *point_y),
-            (None, None) => {
-                self.screenshot_coordinate_mapping(screenshot_id)?;
-                return Ok(());
-            }
-            _ => return Err("Screenshot coordinate conversion requires both x and y.".to_string()),
+        artifact: &ScreenshotArtifact,
+    ) -> std::result::Result<ScreenshotCapture, String> {
+        let raw = capture_screenshot_raw()
+            .await
+            .map_err(|error| format!("verification screenshot failed: {error:#}"))?;
+        self.cache_desktop_size(raw.width, raw.height);
+        let layout_fingerprint = self.monitor_layout_fingerprint(raw.width, raw.height).await;
+        let rect = artifact.transform.desktop_rect;
+        let bounds = crate::windowing::WindowBounds {
+            x: Some(rect.x),
+            y: Some(rect.y),
+            width: rect.width,
+            height: rect.height,
         };
-        let (desktop_x, desktop_y) =
-            self.screenshot_point_to_desktop(point_x, point_y, screenshot_id)?;
-        *x = Some(desktop_x);
-        *y = Some(desktop_y);
-        Ok(())
+        let crop = window_crop_rect_for_capture(&bounds, raw.width, raw.height)?;
+        let (bytes, width, height) =
+            crop_image_to_png(&raw.bytes, crop.x, crop.y, crop.width, crop.height)
+                .map_err(|error| format!("verification crop failed: {error:#}"))?;
+        let mut capture = prepare_screenshot_payload(
+            RawScreenshotCapture {
+                bytes,
+                source: raw.source,
+                width,
+                height,
+            },
+            ScreenshotPayloadOptions {
+                max_width: Some(artifact.capture.width),
+                max_height: Some(artifact.capture.height),
+                max_bytes: Some(4 * 1024 * 1024),
+                encoding: ScreenshotEncodingPolicy::Adaptive,
+            },
+        )
+        .map_err(|error| format!("verification resize failed: {error:#}"))?;
+        capture.coordinate_origin_x = crop.x;
+        capture.coordinate_origin_y = crop.y;
+        capture.cropped_to_window = artifact.transform.window.is_some();
+        capture.target_window_id = artifact.transform.window.map(|window| window.window_id);
+        self.cache_screenshot_artifact(&capture, layout_fingerprint, artifact.transform.window);
+        Ok(capture)
+    }
+
+    async fn resolve_screenshot_points(
+        &self,
+        screenshot_id: &str,
+        points: &[(i32, i32)],
+    ) -> std::result::Result<Vec<(i32, i32)>, String> {
+        let artifact = self.screenshot_artifact(screenshot_id)?;
+        if let Some(window) = artifact.transform.window {
+            let target = WindowTarget {
+                window_id: Some(window.window_id),
+                ..Default::default()
+            };
+            self.focus_target_for_input(&target).await?;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+
+        let (desktop_width, desktop_height) = self
+            .desktop_size
+            .lock()
+            .map_err(|_| "Desktop geometry cache is unavailable.".to_string())?
+            .ok_or_else(|| {
+                "Desktop capture geometry is unavailable; capture a new screenshot.".to_string()
+            })?;
+        let current_layout = self
+            .monitor_layout_fingerprint(desktop_width, desktop_height)
+            .await;
+        let current_window = match artifact.transform.window {
+            Some(expected) => {
+                let windows = list_windows().await.map_err(|error| {
+                    format!("STALE_SCREENSHOT: cannot verify window: {error:#}")
+                })?;
+                windows
+                    .iter()
+                    .find(|window| window.window_id == expected.window_id)
+                    .and_then(window_snapshot)
+            }
+            None => None,
+        };
+        artifact
+            .transform
+            .validate_context(&current_layout, current_window, Instant::now())?;
+        points
+            .iter()
+            .map(|(x, y)| artifact.transform.map_pixel(*x, *y))
+            .collect()
+    }
+
+    async fn monitor_layout_fingerprint(&self, capture_width: u32, capture_height: u32) -> String {
+        match crate::windowing::backends::gnome::extension_monitor_layout().await {
+            Ok(mut monitors) if !monitors.is_empty() => {
+                monitors.sort_by_key(|monitor| monitor.index);
+                let entries = monitors
+                    .iter()
+                    .map(|monitor| {
+                        format!(
+                            "{}:{},{},{}x{}@{:.4}:{}",
+                            monitor.index,
+                            monitor.x,
+                            monitor.y,
+                            monitor.width,
+                            monitor.height,
+                            monitor.scale,
+                            monitor.primary
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                format!("gnome:{capture_width}x{capture_height}:{entries}")
+            }
+            _ => {
+                if env::var_os("DISPLAY").is_some() {
+                    if let Ok(Ok(output)) = timeout(
+                        Duration::from_secs(2),
+                        TokioCommand::new("xrandr")
+                            .arg("--listmonitors")
+                            .stdin(Stdio::null())
+                            .output(),
+                    )
+                    .await
+                    {
+                        if output.status.success() {
+                            let layout = String::from_utf8_lossy(&output.stdout)
+                                .lines()
+                                .map(str::trim)
+                                .filter(|line| !line.is_empty())
+                                .collect::<Vec<_>>()
+                                .join("|");
+                            if !layout.is_empty() {
+                                return format!("xrandr:{capture_width}x{capture_height}:{layout}");
+                            }
+                        }
+                    }
+                }
+                format!("capture:{capture_width}x{capture_height}")
+            }
+        }
     }
 
     /// COORDINATE SPACES: window bounds (list_windows / extension frame rects)
@@ -3509,40 +4450,53 @@ fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
     ))
 }
 
-fn screenshot_point_to_desktop(
-    mapping: &ScreenshotCoordinateMap,
-    x: i32,
-    y: i32,
-) -> std::result::Result<(i32, i32), String> {
-    if mapping.image_width == 0
-        || mapping.image_height == 0
-        || mapping.coordinate_width == 0
-        || mapping.coordinate_height == 0
-    {
-        return Err("The cached screenshot has invalid coordinate metadata.".to_string());
-    }
-    if x < 0 || y < 0 || x as u32 >= mapping.image_width || y as u32 >= mapping.image_height {
-        return Err(format!(
-            "Screenshot coordinate {x},{y} is outside the most recently returned image ({}x{}).",
-            mapping.image_width, mapping.image_height
-        ));
-    }
+fn normalize_visual_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
 
-    let scaled_x = ((x as i64 * mapping.coordinate_width as i64)
-        + i64::from(mapping.image_width / 2))
-        / i64::from(mapping.image_width);
-    let scaled_y = ((y as i64 * mapping.coordinate_height as i64)
-        + i64::from(mapping.image_height / 2))
-        / i64::from(mapping.image_height);
-    let desktop_x = i64::from(mapping.origin_x)
-        .checked_add(scaled_x)
-        .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| "Screenshot x coordinate overflowed desktop coordinates.".to_string())?;
-    let desktop_y = i64::from(mapping.origin_y)
-        .checked_add(scaled_y)
-        .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| "Screenshot y coordinate overflowed desktop coordinates.".to_string())?;
-    Ok((desktop_x, desktop_y))
+fn expand_visual_bounds(
+    bounds: ImageBounds,
+    image_width: u32,
+    image_height: u32,
+    role: Option<&str>,
+) -> Option<ImageBounds> {
+    if bounds.width == 0 || bounds.height == 0 || image_width == 0 || image_height == 0 {
+        return None;
+    }
+    let (pad_x, pad_y) = match role.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("textbox" | "text" | "entry" | "input") => (12_i64, 8_i64),
+        Some("button" | "push button" | "menu item") => (10_i64, 6_i64),
+        Some(_) => (8_i64, 6_i64),
+        None => (0_i64, 0_i64),
+    };
+    let left = (i64::from(bounds.x) - pad_x).max(0);
+    let top = (i64::from(bounds.y) - pad_y).max(0);
+    let right = (i64::from(bounds.x) + i64::from(bounds.width) + pad_x).min(i64::from(image_width));
+    let bottom =
+        (i64::from(bounds.y) + i64::from(bounds.height) + pad_y).min(i64::from(image_height));
+    (right > left && bottom > top).then_some(ImageBounds {
+        x: i32::try_from(left).ok()?,
+        y: i32::try_from(top).ok()?,
+        width: u32::try_from(right - left).ok()?,
+        height: u32::try_from(bottom - top).ok()?,
+    })
+}
+
+fn new_visual_target_id() -> Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)?;
+    let mut id = String::from("target-");
+    id.reserve(random.len() * 2);
+    for byte in random {
+        id.push(HEX[(byte >> 4) as usize] as char);
+        id.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(id)
 }
 
 /// Build a best-effort logical AT-SPI -> physical X11 transform by aligning
@@ -3834,6 +4788,78 @@ fn window_bounds_match_capture_space(window: &WindowInfo) -> bool {
     )
 }
 
+fn window_snapshot(window: &WindowInfo) -> Option<WindowSnapshot> {
+    let bounds = window.bounds.as_ref()?;
+    let frame_rect = DesktopRect {
+        x: bounds.x?,
+        y: bounds.y?,
+        width: bounds.width,
+        height: bounds.height,
+    };
+    (frame_rect.width > 0 && frame_rect.height > 0).then_some(WindowSnapshot {
+        window_id: window.window_id,
+        frame_rect,
+        client_rect: None,
+        client_insets: None,
+    })
+}
+
+fn prepare_get_app_state_capture(
+    raw: RawScreenshotCapture,
+    window: Option<&WindowInfo>,
+    options: ScreenshotPayloadOptions,
+) -> std::result::Result<(ScreenshotCapture, Option<WindowSnapshot>), String> {
+    let Some(window) = window else {
+        return prepare_screenshot_payload(raw, options)
+            .map(|capture| (capture, None))
+            .map_err(|error| format!("screenshot resize failed: {error:#}"));
+    };
+    if !window_bounds_match_capture_space(window) {
+        return Err(format!(
+            "targeted get_app_state cannot safely crop window_id {} from backend {:?}: its bounds are not physical screenshot pixels",
+            window.window_id, window.backend
+        ));
+    }
+    let snapshot = window_snapshot(window).ok_or_else(|| {
+        format!(
+            "targeted get_app_state window_id {} has incomplete or empty bounds",
+            window.window_id
+        )
+    })?;
+    let rect = window_crop_rect_for_capture(
+        window
+            .bounds
+            .as_ref()
+            .expect("window snapshot requires bounds"),
+        raw.width,
+        raw.height,
+    )?;
+    let (bytes, width, height) =
+        crop_image_to_png(&raw.bytes, rect.x, rect.y, rect.width, rect.height)
+            .map_err(|error| format!("targeted get_app_state crop failed: {error:#}"))?;
+    if width != rect.width || height != rect.height {
+        return Err(format!(
+            "targeted get_app_state crop returned {width}x{height}; expected {}x{}",
+            rect.width, rect.height
+        ));
+    }
+    let mut capture = prepare_screenshot_payload(
+        RawScreenshotCapture {
+            bytes,
+            source: raw.source,
+            width,
+            height,
+        },
+        options,
+    )
+    .map_err(|error| format!("targeted get_app_state resize failed: {error:#}"))?;
+    capture.coordinate_origin_x = rect.x;
+    capture.coordinate_origin_y = rect.y;
+    capture.cropped_to_window = true;
+    capture.target_window_id = Some(window.window_id);
+    Ok((capture, Some(snapshot)))
+}
+
 /// Intersect window bounds with the pixels present in a full-desktop capture.
 /// The returned origin is both the PNG crop origin and the physical desktop
 /// origin represented by pixel (0, 0) in the cropped result. Raw captures do
@@ -4036,6 +5062,97 @@ fn action_result(
     received: Option<serde_json::Value>,
 ) -> ActionOutput {
     action_result_for_backend(action, result, received, "ydotool")
+}
+
+fn rejected_action(
+    action: &str,
+    message: String,
+    received: Option<serde_json::Value>,
+) -> ActionOutput {
+    ActionOutput {
+        dispatched: false,
+        landed: None,
+        verified: false,
+        ok: false,
+        implemented: true,
+        action: action.to_string(),
+        message,
+        received,
+    }
+}
+
+fn rejected_click_verification(target_id: &str, message: String) -> ClickVerificationOutput {
+    ClickVerificationOutput {
+        ok: false,
+        stage: "rejected".to_string(),
+        dispatched: false,
+        landed: None,
+        verified: false,
+        target_id: target_id.to_string(),
+        screenshot_id: None,
+        pointer_arrived: None,
+        actual_pointer_x: None,
+        actual_pointer_y: None,
+        region_change_score: None,
+        region_changed: None,
+        expected_text_present: None,
+        expected_text_absent: None,
+        focused_editable: None,
+        evidence_screenshot_id: None,
+        message,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatched_unverified(
+    params: &ClickAndVerifyParams,
+    target: &VisualTarget,
+    pointer_arrived: Option<bool>,
+    actual_pointer: Option<(i32, i32)>,
+    region_change_score: Option<f64>,
+    region_changed: Option<bool>,
+    expected_text_present: Option<bool>,
+    expected_text_absent: Option<bool>,
+    focused_editable: Option<bool>,
+    evidence_screenshot_id: Option<String>,
+    message: String,
+) -> ClickVerificationOutput {
+    ClickVerificationOutput {
+        ok: false,
+        stage: "dispatched_unverified".to_string(),
+        dispatched: true,
+        landed: pointer_arrived,
+        verified: false,
+        target_id: params.target_id.clone(),
+        screenshot_id: Some(target.screenshot_id.clone()),
+        pointer_arrived,
+        actual_pointer_x: actual_pointer.map(|point| point.0),
+        actual_pointer_y: actual_pointer.map(|point| point.1),
+        region_change_score,
+        region_changed,
+        expected_text_present,
+        expected_text_absent,
+        focused_editable,
+        evidence_screenshot_id,
+        message,
+    }
+}
+
+fn query_x11_pointer_position() -> std::result::Result<(i32, i32), String> {
+    use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
+    let (connection, screen_index) =
+        x11rb::connect(None).map_err(|error| format!("connect to X11: {error}"))?;
+    let screen = connection
+        .setup()
+        .roots
+        .get(screen_index)
+        .ok_or_else(|| "X11 screen index is invalid".to_string())?;
+    let reply = connection
+        .query_pointer(screen.root)
+        .map_err(|error| format!("query X11 pointer: {error}"))?
+        .reply()
+        .map_err(|error| format!("read X11 pointer reply: {error}"))?;
+    Ok((i32::from(reply.root_x), i32::from(reply.root_y)))
 }
 
 fn action_result_for_backend(
@@ -6228,7 +7345,6 @@ mod tests {
         let diagnostics = doctor_report();
         let capture = prepare_screenshot_payload(
             RawScreenshotCapture {
-                mime_type: "image/png".to_string(),
                 bytes: solid_png(16, 16),
                 source: "test".to_string(),
                 width: 16,
@@ -6299,6 +7415,9 @@ mod tests {
         assert!(!structured_json.contains("data:image"));
         assert!(!structured_json.contains("data_url"));
         assert!(!structured_json.contains(&expected_image_data));
+        assert!(structured["screenshot"].get("format").is_none());
+        assert!(structured["screenshot"].get("quality").is_none());
+        assert!(structured["screenshot"].get("scale").is_none());
         assert_eq!(structured["screenshot"]["screenshot_id"], screenshot_id);
         assert_eq!(structured["screenshot"]["width"], 16);
         assert_eq!(structured["screenshot"]["coordinate_width"], 16);
@@ -6319,12 +7438,136 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_tool_schemas_expose_constraints_instead_of_encoding_choices() {
+        let tools = ComputerUseLinux::tool_router().list_all();
+        let input_schema = |name: &str| {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            serde_json::Value::Object(tool.input_schema.as_ref().clone())
+        };
+
+        for name in ["get_app_state", "screenshot"] {
+            let schema = input_schema(name);
+            let properties = schema["properties"].as_object().unwrap();
+            assert!(properties.contains_key("max_bytes"));
+            assert!(properties.contains_key("max_width"));
+            assert!(properties.contains_key("max_height"));
+            assert!(!properties.contains_key("format"));
+            assert!(!properties.contains_key("quality"));
+            assert!(!properties.contains_key("scale"));
+        }
+
+        let compressed = input_schema("screenshot_compressed");
+        let properties = compressed["properties"].as_object().unwrap();
+        assert!(properties.contains_key("quality"));
+        assert!(properties.contains_key("max_bytes"));
+        assert!(properties.contains_key("max_width"));
+        assert!(properties.contains_key("max_height"));
+        assert!(!properties.contains_key("format"));
+        assert!(!properties.contains_key("scale"));
+    }
+
+    #[test]
+    fn coordinate_action_schemas_have_no_implicit_coordinate_space() {
+        let tools = ComputerUseLinux::tool_router().list_all();
+        let properties = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"))
+                .input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap()
+        };
+
+        let semantic = properties("click");
+        assert!(!semantic.contains_key("x"));
+        assert!(!semantic.contains_key("y"));
+        assert!(!semantic.contains_key("coordinate_space"));
+        assert!(!semantic.contains_key("screenshot_id"));
+
+        for name in ["click_screenshot", "drag_screenshot", "scroll_screenshot"] {
+            let schema = properties(name);
+            assert!(schema.contains_key("screenshot_id"));
+            assert!(!schema.contains_key("coordinate_space"));
+        }
+        for name in ["click_desktop", "drag_desktop", "scroll_desktop"] {
+            let schema = properties(name);
+            assert!(!schema.contains_key("screenshot_id"));
+            assert!(!schema.contains_key("coordinate_space"));
+        }
+    }
+
+    #[test]
+    fn visual_locator_tools_require_a_screenshot_id() {
+        let tools = ComputerUseLinux::tool_router().list_all();
+        for name in ["locate_text", "locate_control"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            let properties = tool.input_schema["properties"].as_object().unwrap();
+            assert!(properties.contains_key("screenshot_id"));
+            assert!(properties.contains_key("text"));
+        }
+    }
+
+    #[test]
+    fn verified_click_tools_accept_target_ids_not_coordinates() {
+        let tools = ComputerUseLinux::tool_router().list_all();
+        for name in ["click_target", "click_and_verify"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            let properties = tool.input_schema["properties"].as_object().unwrap();
+            assert!(properties.contains_key("target_id"));
+            assert!(!properties.contains_key("x"));
+            assert!(!properties.contains_key("y"));
+            assert!(!properties.contains_key("screenshot_id"));
+        }
+    }
+
+    #[test]
+    fn visual_text_matching_ignores_case_and_ocr_whitespace() {
+        assert!(normalize_visual_text("公益站 自 动签到")
+            .contains(&normalize_visual_text("公益站自动签到")));
+        assert_eq!(normalize_visual_text("Save NOW"), "savenow");
+    }
+
+    #[test]
+    fn inferred_control_bounds_are_expanded_and_clipped() {
+        assert_eq!(
+            expand_visual_bounds(
+                ImageBounds {
+                    x: 2,
+                    y: 3,
+                    width: 20,
+                    height: 10
+                },
+                100,
+                50,
+                Some("button"),
+            ),
+            Some(ImageBounds {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 19
+            })
+        );
+    }
+
+    #[test]
     fn window_crop_happens_before_screenshot_payload_resize() {
         let (cropped, width, height) =
             crop_image_to_png(&solid_png(400, 200), 50, 20, 200, 100).unwrap();
         let capture = prepare_screenshot_payload(
             RawScreenshotCapture {
-                mime_type: "image/png".to_string(),
                 bytes: cropped,
                 source: "test".to_string(),
                 width,
@@ -6345,6 +7588,56 @@ mod tests {
         );
         assert_eq!((capture.width, capture.height), (100, 50));
         assert!(capture.resized);
+    }
+
+    #[test]
+    fn targeted_get_app_state_returns_only_the_strict_window_crop() {
+        let mut window = window_with_bounds(7, 50, 20, 200, 100);
+        window.backend = crate::windowing::XDOTOOL_BACKEND.to_string();
+        let (capture, snapshot) = prepare_get_app_state_capture(
+            RawScreenshotCapture {
+                bytes: solid_png(400, 200),
+                source: "test".to_string(),
+                width: 400,
+                height: 200,
+            },
+            Some(&window),
+            ScreenshotPayloadOptions {
+                max_width: Some(400),
+                max_height: Some(200),
+                max_bytes: Some(1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!((capture.width, capture.height), (200, 100));
+        assert_eq!(
+            (capture.coordinate_origin_x, capture.coordinate_origin_y),
+            (50, 20)
+        );
+        assert!(capture.cropped_to_window);
+        assert_eq!(capture.target_window_id, Some(7));
+        assert_eq!(snapshot.unwrap().window_id, 7);
+    }
+
+    #[test]
+    fn targeted_get_app_state_never_falls_back_to_full_desktop() {
+        let mut window = window_with_bounds(7, 50, 20, 200, 100);
+        window.backend = "gnome-shell-extension".to_string();
+        let error = prepare_get_app_state_capture(
+            RawScreenshotCapture {
+                bytes: solid_png(400, 200),
+                source: "test".to_string(),
+                width: 400,
+                height: 200,
+            },
+            Some(&window),
+            ScreenshotPayloadOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cannot safely crop"));
     }
 
     #[test]
@@ -7015,78 +8308,61 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_coordinates_scale_to_physical_desktop_pixels() {
-        let mapping = ScreenshotCoordinateMap {
-            screenshot_id: "shot-current".to_string(),
-            image_width: 1920,
-            image_height: 1080,
-            coordinate_width: 2560,
-            coordinate_height: 1440,
-            origin_x: 0,
-            origin_y: 0,
-        };
-
-        assert_eq!(
-            screenshot_point_to_desktop(&mapping, 900, 300).unwrap(),
-            (1200, 400)
-        );
-        assert_eq!(
-            screenshot_point_to_desktop(&mapping, 1919, 1079).unwrap(),
-            (2559, 1439)
-        );
-    }
-
-    #[test]
-    fn cropped_screenshot_coordinates_include_desktop_origin() {
-        let mapping = ScreenshotCoordinateMap {
-            screenshot_id: "shot-current".to_string(),
-            image_width: 960,
-            image_height: 540,
-            coordinate_width: 1280,
-            coordinate_height: 720,
-            origin_x: 100,
-            origin_y: 50,
-        };
-
-        assert_eq!(
-            screenshot_point_to_desktop(&mapping, 480, 270).unwrap(),
-            (740, 410)
-        );
-    }
-
-    #[test]
-    fn screenshot_coordinate_conversion_requires_latest_mapping_and_in_range_points() {
+    fn screenshot_coordinate_cache_keeps_multiple_ids_and_crop_origins() {
         let backend = ComputerUseLinux::default();
-        let missing = backend
-            .screenshot_point_to_desktop(10, 20, Some("shot-current"))
-            .unwrap_err();
-        assert!(missing.contains("Call get_app_state or screenshot"));
-
-        let mapping = ScreenshotCoordinateMap {
-            screenshot_id: "shot-current".to_string(),
-            image_width: 1920,
-            image_height: 1080,
-            coordinate_width: 2560,
-            coordinate_height: 1440,
-            origin_x: 0,
-            origin_y: 0,
+        let make_capture = |id: &str, origin_x: i32, origin_y: i32| {
+            let mut capture = prepare_screenshot_payload(
+                RawScreenshotCapture {
+                    bytes: solid_png(960, 540),
+                    source: "test".to_string(),
+                    width: 960,
+                    height: 540,
+                },
+                ScreenshotPayloadOptions {
+                    max_width: Some(960),
+                    max_height: Some(540),
+                    max_bytes: Some(4 * 1024 * 1024),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            capture.screenshot_id = id.to_string();
+            capture.coordinate_width = 1280;
+            capture.coordinate_height = 720;
+            capture.coordinate_origin_x = origin_x;
+            capture.coordinate_origin_y = origin_y;
+            capture
         };
-        *backend.last_screenshot_coordinates.lock().unwrap() = Some(mapping);
-        let missing_id = backend
-            .screenshot_point_to_desktop(10, 20, None)
-            .unwrap_err();
-        assert!(missing_id.contains("screenshot_id is required"));
+        let first = make_capture("shot-first", 100, 50);
+        let second = make_capture("shot-second", -200, -100);
+        backend.cache_screenshot_artifact(&first, "layout".to_string(), None);
+        backend.cache_screenshot_artifact(&second, "layout".to_string(), None);
 
-        let stale = backend
-            .screenshot_point_to_desktop(10, 20, Some("shot-stale"))
-            .unwrap_err();
-        assert!(stale.contains("does not match"));
-        assert!(stale.contains("shot-current"));
-
-        let outside = backend
-            .screenshot_point_to_desktop(1920, 100, Some("shot-current"))
-            .unwrap_err();
-        assert!(outside.contains("outside the most recently returned image"));
+        assert_eq!(
+            backend
+                .screenshot_artifact("shot-first")
+                .unwrap()
+                .transform
+                .map_pixel(480, 270)
+                .unwrap(),
+            (740, 410),
+        );
+        assert_eq!(
+            backend
+                .screenshot_artifact("shot-second")
+                .unwrap()
+                .transform
+                .map_pixel(480, 270)
+                .unwrap(),
+            (440, 260),
+        );
+        assert!(backend
+            .screenshot_artifact("shot-first")
+            .unwrap()
+            .transform
+            .map_pixel(960, 100)
+            .unwrap_err()
+            .contains("outside image"));
     }
 
     #[test]
@@ -7923,8 +9199,6 @@ mod tests {
             wm_class: None,
             window_title: None,
             relative: Some(true),
-            coordinate_space: CoordinateSpace::Desktop,
-            screenshot_id: None,
         };
         let focus = WindowFocusResult {
             requested_window: window_with_bounds(1, 100, 200, 800, 600),
@@ -7953,8 +9227,6 @@ mod tests {
             wm_class: None,
             window_title: None,
             relative: None,
-            coordinate_space: CoordinateSpace::Desktop,
-            screenshot_id: None,
         };
         let focus = WindowFocusResult {
             requested_window: window_with_bounds(1, 100, 200, 800, 600),
@@ -7983,8 +9255,6 @@ mod tests {
             wm_class: None,
             window_title: None,
             relative: None,
-            coordinate_space: CoordinateSpace::Desktop,
-            screenshot_id: None,
         };
         let mut window = window_with_bounds(1, 0, 0, 1, 1);
         window.bounds = None;
@@ -8016,8 +9286,6 @@ mod tests {
             wm_class: None,
             window_title: None,
             relative: Some(true),
-            coordinate_space: CoordinateSpace::Desktop,
-            screenshot_id: None,
         };
         let focus = WindowFocusResult {
             requested_window: window_with_bounds(1, 100, 200, 800, 600),
